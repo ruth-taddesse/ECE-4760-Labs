@@ -28,7 +28,7 @@ pico_sdk_init()
 
 add_executable(Audio_Timer_Interrupt_DDS)
 
-target_sources(Audio_Timer_Interrupt_DDS PRIVATE ADC_with_DDS.c)
+target_sources(Audio_Timer_Interrupt_DDS PRIVATE ADC_DDS_keypad_speedup.c)
 
 target_link_libraries(  Audio_Timer_Interrupt_DDS 
                         pico_stdlib 
@@ -42,6 +42,8 @@ target_link_libraries(  Audio_Timer_Interrupt_DDS
                         hardware_clocks
                         hardware_vreg
                         hardware_clocks
-                        hardware_adc)
+                        hardware_adc
+                        hardware_pio
+                        hardware_dma)
 
 pico_add_extra_outputs(Audio_Timer_Interrupt_DDS)

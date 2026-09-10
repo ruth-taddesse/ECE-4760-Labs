@@ -88,6 +88,32 @@ unsigned int button = 0x70 ;
 char keytext[40];
 int prev_key = 0;
 
+//muting variables
+#define AMPLITUDE_STEP 103 // 20 updates at 1 ms each for a full fade
+volatile bool tone_enabled = false;
+volatile int amplitude = 0; // 0 = silent, 2047 = full amplitude
+
+//record variables
+
+#define RECORD_HZ 100
+#define MAX_SAMPLES (10 * RECORD_HZ)
+
+volatile bool record_mode = false;
+volatile bool record = false;
+volatile bool play = false;
+volatile int record_button = -1;
+volatile int play_button = -1;
+volatile int play_index = 0;
+volatile uint16_t sounds[9][MAX_SAMPLES];
+static unsigned int sound_length[9] = {0};
+
+//debouncing states
+#define NOT_PRESSED 0
+#define MAYBE_PRESSED 1
+#define PRESSED 2
+#define MAYBE_NOT_PRESSED 3
+
+
 // ==================================================
 // === toggle25 thread 
 // ==================================================
@@ -103,10 +129,13 @@ static PT_THREAD (protothread_toggle25(struct pt *pt))
         // Read the ADC
         adc_val = adc_read() ;
 
-        phase_incr_main = (map(adc_val, 0, 4095, 0, 10000)*two32)/Fs;
+        if (!play){
+          phase_incr_main = (map(adc_val, 0, 4095, 0, 10000)*two32)/Fs;
+        }
+        
 
         // Print the value
-        printf("ADC value: %d\n", adc_val) ;
+        //printf("ADC value: %d\n", adc_val) ;
 
         // Yield
         PT_YIELD_usec(10000) ; //yeild every 10 ms
@@ -124,10 +153,10 @@ static PT_THREAD (protothread_core_0(struct pt *pt))
     // Some variables
     static int i ;
     static uint32_t keypad ;
+    static int possible;
+    static int state;
 
     while(1) {
-
-        gpio_put(LED, !gpio_get(LED)) ;
 
         // Scan the keypad!
         for (i=0; i<KEYROWS; i++) {
@@ -153,13 +182,165 @@ static PT_THREAD (protothread_core_0(struct pt *pt))
         // Otherwise, indicate invalid/non-pressed buttons
         else (i=-1) ;
 
-        // Print key to terminal
-        printf("\n%d", i) ;
+        switch (state) {
+
+          case NOT_PRESSED:
+            if (i != -1) {
+              possible = i;
+              state = MAYBE_PRESSED;
+            }
+            break;
+
+          case MAYBE_PRESSED:
+            if (i == possible){
+              state = PRESSED;
+              // Toggle once on confirmed release of the remembered key.
+              if (possible == 0) {
+                tone_enabled = !tone_enabled;
+              ;
+              }
+
+              if (possible == 10){
+                record_mode = true;
+                play = false;
+              }
+
+              if (!record_mode && (possible <=9 && possible >= 1)){
+                play = true;
+                play_button = possible;
+                play_index = 0;
+                tone_enabled = true;
+              }
+              // Print key to terminal
+              printf("\n%d", i); 
+            }
+            else {
+              state = NOT_PRESSED;
+            }
+            break;
+          
+          case PRESSED:
+            if (i == possible){
+              state = PRESSED;
+              if (record_mode && (possible <=9 && possible >= 1)){
+                record_button = possible;
+                record = true;
+              }
+            }
+            else {
+              state = MAYBE_NOT_PRESSED;
+            }
+            break;
+
+          case MAYBE_NOT_PRESSED:
+            if (i == possible){
+              state = PRESSED;
+            }
+            else {
+              state = NOT_PRESSED;
+              if (record_mode && possible == record_button){
+                record_mode = false;
+                record = false;
+                record_button = -1;
+              }
+              }
+            break;
+
+          default:
+            state = NOT_PRESSED;
+            break;
+
+        }
 
         PT_YIELD_usec(30000) ;
     }
     // Indicate thread end
     PT_END(pt) ;
+}
+
+// This thread ramps up/down amplitude of output wave
+static PT_THREAD (protothread_amplitude(struct pt *pt))
+{
+    // Indicate thread beginning
+    PT_BEGIN(pt) ;
+
+    while (1){
+
+      if (tone_enabled && amplitude < 2047){
+        int next_amplitude = amplitude + AMPLITUDE_STEP;
+        amplitude = (next_amplitude > 2047) ? 2047 : next_amplitude;
+      }
+
+      else if (!tone_enabled && amplitude > 0){
+        int next_amplitude = amplitude - AMPLITUDE_STEP;
+        amplitude = (next_amplitude < 0) ? 0 : next_amplitude;
+      }
+
+      PT_YIELD_usec(1000) ;
+    }
+
+    PT_END(pt) ;
+
+}
+
+// This thread handkes playback
+static PT_THREAD (protothread_playback(struct pt *pt))
+{
+    // Indicate thread beginning
+    PT_BEGIN(pt) ;
+
+    while (1){
+
+      if (play){
+        if (play_index < sound_length[play_button - 1]) {
+          uint16_t frequency = sounds[play_button - 1][play_index++];
+
+          phase_incr_main = (unsigned int)((frequency * two32) / Fs);
+        }
+        else {
+          play_index = 0;
+          play = false;
+          tone_enabled = false;
+        }
+      }
+      else{
+        play_index = 0;
+      }
+
+      PT_YIELD_usec(10000) ;
+    }
+
+    PT_END(pt) ;
+
+}
+
+static PT_THREAD (protothread_recording(struct pt *pt))
+{
+    // Indicate thread beginning
+    PT_BEGIN(pt) ;
+
+    static int length = 0;
+
+    while (1){
+
+      if (record){
+
+        if(record_button != -1 && length < MAX_SAMPLES){
+          sounds[record_button - 1][length] = (uint16_t)map(adc_val, 0, 4095, 0, 10000);;
+          length++;
+          sound_length[record_button - 1] = length;
+        }
+      }
+      else{
+        length = 0;
+      }
+
+
+      PT_YIELD_usec(10000) ;
+    }
+
+    PT_END(pt) ;
+
 }
 
 // Alarm ISR
@@ -176,7 +357,8 @@ static void alarm_irq(void) {
 
     // DDS phase and sine table lookup
     phase_accum_main += phase_incr_main  ;
-    DAC_data = (DAC_config_chan_A | ((sin_table[phase_accum_main>>24] + 2048) & 0xffff))  ;
+
+    DAC_data = (DAC_config_chan_A | (((sin_table[phase_accum_main>>24] * amplitude)/2047 + 2048) & 0xffff))  ;
 
     // Perform an SPI transaction
     spi_write16_blocking(SPI_PORT, &DAC_data, 1) ;
@@ -259,6 +441,10 @@ int main(){
 
   // === config threads ========================
   pt_add_thread(protothread_toggle25);
+  pt_add_thread(protothread_core_0);
+  pt_add_thread(protothread_amplitude);
+  pt_add_thread(protothread_playback);
+  pt_add_thread(protothread_recording);
   
   // === initalize the scheduler ===============
   pt_schedule_start ;
