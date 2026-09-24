@@ -92,6 +92,9 @@ char color = WHITE ;
 char text[16];
 volatile int count = 0;
 
+// Create a semaphore
+semaphore_t draw_semaphore ;
+
 void print_to_vga(int number){
   snprintf(text, sizeof(text), "%d", number);
 
@@ -110,6 +113,8 @@ void gpio_callback(uint gpio, uint32_t event_mask) {
     else{
       count--;
     }
+
+    PT_SEM_SDK_SIGNAL(pt, &draw_semaphore) ;
 }
 
 // static PT_THREAD (protothread_draw_count(struct pt *pt))
@@ -387,6 +392,31 @@ static PT_THREAD (protothread_anim(struct pt *pt))
   PT_END(pt);
 } // animation thread
 
+#define COUNT_X       (ARENA_LEFT + 10)
+#define COUNT_Y       (ARENA_TOP + 10)
+#define COUNT_WIDTH   (12 * 12)
+#define COUNT_HEIGHT  16
+
+static PT_THREAD (protothread_draw_count(struct pt *pt))
+{
+    // Mark beginning of thread
+    PT_BEGIN(pt);
+
+    while(1) {
+      PT_SEM_SDK_WAIT(pt, &draw_semaphore);
+      clearRect(
+            COUNT_X,
+            COUNT_Y,
+            COUNT_X + COUNT_WIDTH,
+            COUNT_Y + COUNT_HEIGHT,
+            BLACK
+        );
+      print_to_vga(count);
+      
+    } // END WHILE(1)
+  PT_END(pt);
+} // animation thread
+
 // ========================================
 // === main
 // ========================================
@@ -402,6 +432,10 @@ int main(){
 
   // initialize random seed generator
   srand((unsigned int)time(NULL));
+
+  // Initialize the semaphore
+  // Arguments: pointer to sem, initial count, max count
+  sem_init(&draw_semaphore, 0, 1) ;
 
   //initialize rotary A
   gpio_init(a_pin) ;
