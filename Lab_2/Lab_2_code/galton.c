@@ -92,8 +92,9 @@ char color = WHITE ;
 char text[16];
 volatile int count = 0;
 
-// Create a semaphore
-semaphore_t draw_semaphore ;
+// Coordinate drawing between the animation and count threads.
+semaphore_t draw_count_start ;
+semaphore_t draw_count_done ;
 
 void print_to_vga(int number){
   snprintf(text, sizeof(text), "%d", number);
@@ -105,6 +106,14 @@ void print_to_vga(int number){
 }
 
 void gpio_callback(uint gpio, uint32_t event_mask) {
+    static uint32_t last_event_us = 0;
+    uint32_t now = time_us_32();
+
+    // Ignore repeated edges caused by mechanical contact bounce.
+    if ((uint32_t)(now - last_event_us) < 2000) {
+      return;
+    }
+    last_event_us = now;
 
     if (gpio_get(b_pin)){
       count++;
@@ -113,8 +122,6 @@ void gpio_callback(uint gpio, uint32_t event_mask) {
     else{
       count--;
     }
-
-    PT_SEM_SDK_SIGNAL(pt, &draw_semaphore) ;
 }
 
 // static PT_THREAD (protothread_draw_count(struct pt *pt))
@@ -377,8 +384,6 @@ static PT_THREAD (protothread_anim(struct pt *pt))
       PT_YIELD_UNTIL(pt, draw_start_signal()) ;
       // Clear the buffer
       clearLowFrame(0, BLACK);
-      //update count
-      print_to_vga(count);
       // update ball's position and velocity
       updateBall(&ball_x, &ball_y, &ball_vx, &ball_vy) ;
       // draw the ball at its new position
@@ -387,15 +392,13 @@ static PT_THREAD (protothread_anim(struct pt *pt))
       fillCircle(fix2int15(peg_x), fix2int15(peg_y), PEG_RADIUS, peg_color); 
       // draw the boundaries
       drawArena() ;
+      // Let the count thread finish this frame before starting another.
+      PT_SEM_SDK_SIGNAL(pt, &draw_count_start) ;
+      PT_SEM_SDK_WAIT(pt, &draw_count_done) ;
      // NEVER exit while
     } // END WHILE(1)
   PT_END(pt);
 } // animation thread
-
-#define COUNT_X       (ARENA_LEFT + 10)
-#define COUNT_Y       (ARENA_TOP + 10)
-#define COUNT_WIDTH   (12 * 12)
-#define COUNT_HEIGHT  16
 
 static PT_THREAD (protothread_draw_count(struct pt *pt))
 {
@@ -403,16 +406,10 @@ static PT_THREAD (protothread_draw_count(struct pt *pt))
     PT_BEGIN(pt);
 
     while(1) {
-      PT_SEM_SDK_WAIT(pt, &draw_semaphore);
-      clearRect(
-            COUNT_X,
-            COUNT_Y,
-            COUNT_X + COUNT_WIDTH,
-            COUNT_Y + COUNT_HEIGHT,
-            BLACK
-        );
+      PT_SEM_SDK_WAIT(pt, &draw_count_start);
       print_to_vga(count);
-      
+      PT_SEM_SDK_SIGNAL(pt, &draw_count_done);
+
     } // END WHILE(1)
   PT_END(pt);
 } // animation thread
@@ -433,9 +430,9 @@ int main(){
   // initialize random seed generator
   srand((unsigned int)time(NULL));
 
-  // Initialize the semaphore
-  // Arguments: pointer to sem, initial count, max count
-  sem_init(&draw_semaphore, 0, 1) ;
+  // Initialize the per-frame drawing handshake.
+  sem_init(&draw_count_start, 0, 1) ;
+  sem_init(&draw_count_done, 0, 1) ;
 
   //initialize rotary A
   gpio_init(a_pin) ;
