@@ -454,7 +454,7 @@ int main(){
   // add threads
   pt_add_thread(protothread_serial);
   pt_add_thread(protothread_anim);
-  //pt_add_thread(protothread_draw_count);
+  pt_add_thread(protothread_draw_count);
 
   // start scheduler
   pt_schedule_start ;
