@@ -33,23 +33,28 @@ typedef signed int fix15 ;
 #define int2fix15(a) ((fix15)(a << 15))
 #define fix2int15(a) ((int)(a >> 15))
 #define char2fix15(a) (fix15)(((fix15)(a)) << 15)
-#define divfix(a,b) (fix15)(div_s64s64( (((signed long long)(a)) << 15), ((signed long long)(b))))
+// avoiding negative displacement - multiplication instead of left-shifting negative integers
+#define divfix(a,b) ((fix15)div_s64s64((long long)(a) * 32768LL, (long long)(b)))
 
 // Wall detection
-#define hitBottom(b) (b>int2fix15(380))
-#define hitTop(b) (b<int2fix15(100))
-#define hitLeft(a) (a<int2fix15(100))
-#define hitRight(a) (a>int2fix15(540))
+#define hitBottom(b) (b>int2fix15(380 - BALL_RADIUS))
+#define hitTop(b) (b<int2fix15(100 + BALL_RADIUS))
+#define hitLeft(a) (a<int2fix15(100 + BALL_RADIUS))
+#define hitRight(a) (a>int2fix15(540 - BALL_RADIUS))
 
 // uS per frame
 #define FRAME_RATE 33000 // not being used..?
 
 // the color of the ball
-char color = WHITE ;
+char ball_color = WHITE ;
+
+// the color of the peg
+char peg_color = MAGENTA ;
 
 // lab-defined constants
 #define BALL_RADIUS 4
 #define PEG_RADIUS 6
+#define COLLISION_DISTANCE int2fix15(BALL_RADIUS + PEG_RADIUS)
 #define GRAVITY float2fix15(0.37)
 #define BOUNCINESS float2fix15(0.5)
 
@@ -58,6 +63,10 @@ fix15 ball_x ;
 fix15 ball_y ;
 fix15 ball_vx ;
 fix15 ball_vy ;
+
+// Singular, stationary peg (stored in fixed-point pixels)
+static const fix15 peg_x = int2fix15(320);
+static const fix15 peg_y = int2fix15(135);
 
 // create a ball
 void spawnBall(fix15* x, fix15* y, fix15* vx, fix15* vy)
@@ -79,30 +88,72 @@ void drawArena() {
   drawHLine(100, 380, 440, WHITE) ;
 }
 
-// Detect wallstrikes, update velocity and position
-void wallsAndEdges(fix15* x, fix15* y, fix15* vx, fix15* vy)
+// update velocity and position of ball
+void updateBall(fix15* x, fix15* y, fix15* vx, fix15* vy)
 {
-  // Reverse direction if we've hit a wall
-  if (hitTop(*y)) {
-    *vy = (-*vy) ;
-    *y  = (*y + int2fix15(5)) ;
-  }
-  if (hitBottom(*y)) {
-    *vy = (-*vy) ;
-    *y  = (*y - int2fix15(5)) ;
-  } 
-  if (hitRight(*x)) {
-    *vx = (-*vx) ;
-    *x  = (*x - int2fix15(5)) ;
-  }
-  if (hitLeft(*x)) {
-    *vx = (-*vx) ;
-    *x  = (*x + int2fix15(5)) ;
-  } 
-
-  // Update position using velocity
+  // update position using velocity
   *x = *x + *vx ;
   *y = *y + *vy ;
+
+  // calculate distance from peg
+  fix15 dx = *x - peg_x ;
+  fix15 dy = *y - peg_y ;
+
+  // quick check to justify full calculation
+  if (absfix15(dx) < COLLISION_DISTANCE && absfix15(dy) < COLLISION_DISTANCE) {
+    float dx_pixels = fix2float15(dx);
+    float dy_pixels = fix2float15(dy);
+    fix15 distance = float2fix15(sqrtf(dx_pixels * dx_pixels + dy_pixels * dy_pixels));
+    if (distance < COLLISION_DISTANCE) { // peg hit - make sound!
+      fix15 new_x, new_y;
+      if (distance == 0) {
+        new_x = 0;
+        new_y = -int2fix15(1);
+      }
+      else {
+        new_x = divfix(dx, distance);
+        new_y = divfix(dy, distance);
+      }
+      
+      // calculate direction of ball movement in relation to the peg
+      // <0: moving towards peg, >0: moving away, =0: tangent to surface
+      fix15 dir = multfix15(*vx, new_x) + multfix15(*vy, new_y); 
+      if (dir < 0) { // reverse the part of velocity pointing into peg + preserve sideways motion
+        fix15 impulse = -2 * dir;
+        *vx += multfix15(new_x, impulse);
+        *vy += multfix15(new_y, impulse);
+
+        // bounciness!
+        *vx = multfix15(*vx, BOUNCINESS);
+        *vy = multfix15(*vy, BOUNCINESS);
+      }
+      // reposition ball outside of the peg, even if moving away 
+      fix15 separation = int2fix15(BALL_RADIUS + PEG_RADIUS + 1);
+      *x = peg_x + multfix15(new_x, separation);
+      *y = peg_y + multfix15(new_y, separation);
+    }
+  }
+
+  // wall collision logic
+  if (hitTop(*y)) {
+    *y = int2fix15(100 + BALL_RADIUS);
+    if (*vy < 0) {*vy = -*vy;}
+  }
+  if (hitBottom(*y)) {
+    spawnBall(x, y, vx, vy);
+    return;
+  } 
+  if (hitRight(*x)) {
+    *x = int2fix15(540 - BALL_RADIUS);
+    if (*vx > 0) {*vx = -*vx;}
+  }
+  if (hitLeft(*x)) {
+    *x = int2fix15(100 + BALL_RADIUS);
+    if (*vx < 0) {*vx = -*vx;}
+  } 
+
+  *vy += GRAVITY;
+
 }
 
 // ==================================================
@@ -130,7 +181,7 @@ static PT_THREAD (protothread_serial(struct pt *pt))
         sscanf(pt_serial_in_buffer,"%d", &user_input) ;
         // update ball color
         if ((user_input > 0) && (user_input < 16)) {
-          color = (char)user_input ;
+          ball_color = (char)user_input ;
         }
       } // END WHILE(1)
   PT_END(pt);
@@ -151,9 +202,11 @@ static PT_THREAD (protothread_anim(struct pt *pt))
       // Clear the buffer
       clearLowFrame(0, BLACK);
       // update ball's position and velocity
-      wallsAndEdges(&ball_x, &ball_y, &ball_vx, &ball_vy) ;
+      updateBall(&ball_x, &ball_y, &ball_vx, &ball_vy) ;
       // draw the ball at its new position
-      fillCircle(fix2int15(ball_x), fix2int15(ball_y), BALL_RADIUS, color); 
+      fillCircle(fix2int15(ball_x), fix2int15(ball_y), BALL_RADIUS, ball_color); 
+      // draw the peg
+      fillCircle(fix2int15(peg_x), fix2int15(peg_y), PEG_RADIUS, peg_color); 
       // draw the boundaries
       drawArena() ;
      // NEVER exit while
