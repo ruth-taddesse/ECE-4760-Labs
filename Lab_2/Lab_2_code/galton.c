@@ -108,19 +108,19 @@ void gpio_callback(uint gpio, uint32_t event_mask) {
     }
 }
 
-static PT_THREAD (protothread_draw_count(struct pt *pt))
-{
-    // Mark beginning of thread
-    PT_BEGIN(pt);
+// static PT_THREAD (protothread_draw_count(struct pt *pt))
+// {
+//     // Mark beginning of thread
+//     PT_BEGIN(pt);
 
-    while(1) {
-      PT_YIELD_UNTIL(pt, draw_start_signal());
-      clearLowFrame(0, BLACK);
-      print_to_vga(count);
+//     while(1) {
+//       PT_YIELD_UNTIL(pt, draw_start_signal());
+//       clearLowFrame(0, BLACK);
+//       print_to_vga(count);
       
-    } // END WHILE(1)
-  PT_END(pt);
-} // animation thread
+//     } // END WHILE(1)
+//   PT_END(pt);
+// } // animation thread
 
 // the color of the ball
 char ball_color = WHITE ;
@@ -368,6 +368,8 @@ static PT_THREAD (protothread_anim(struct pt *pt))
       PT_YIELD_UNTIL(pt, draw_start_signal()) ;
       // Clear the buffer
       clearLowFrame(0, BLACK);
+      //update count
+      print_to_vga(count);
       // update ball's position and velocity
       updateBall(&ball_x, &ball_y, &ball_vx, &ball_vy) ;
       // draw the ball at its new position
@@ -414,7 +416,7 @@ int main(){
   // add threads
   pt_add_thread(protothread_serial);
   pt_add_thread(protothread_anim);
-  pt_add_thread(protothread_draw_count);
+  //pt_add_thread(protothread_draw_count);
 
   // start scheduler
   pt_schedule_start ;
