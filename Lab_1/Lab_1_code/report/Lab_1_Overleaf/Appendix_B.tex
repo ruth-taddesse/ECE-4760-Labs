@@ -1,0 +1,51 @@
+\section*{Appendix B: AI Use and Prompt Log}
+
+\subsection*{Scope}
+
+This log covers selected questions about the lab code. Repeated review requests and prompts whose responses proposed more than 20 lines of code are left out. It is a shortened log, not a full record of every exchange.
+
+The dates come from the date information available in the conversation. Exact message times were not recorded. We count an edit suggested as one separate code change, rather than one line. Accepted insertions, deletions, and modifications are marked unverified when the conversation does not show enough information to count them. Unverified does not mean zero.
+
+\subsection*{Selected prompts}
+
+\textbf{P1. September 9, 2026; time unavailable.}
+
+``what variable controls to amplitude of sine wave?''
+
+The assistant explained that the sine-table multiplier controls amplitude, the phase increment controls frequency, and the added offset centers the DAC output. This was an explanation, with no specific code edit proposed.
+
+\textbf{P2. September 9, 2026; time unavailable.}
+
+``can we control the amplitude as we write to the dac instead of the sine table?''
+
+The assistant suggested adding an amplitude variable, scaling the signed sine sample before adding the midpoint, and using a 12-bit mask for the DAC data. The final code includes the amplitude variable and scaling. It still uses \texttt{0xffff}, so the suggested \texttt{0x0FFF} mask was not adopted.
+
+\textbf{P3. September 9, 2026; time unavailable.}
+
+Prompt summary: We asked how to use saved frequency values when setting the DAC output during playback.
+
+The assistant explained that saved frequencies should update \texttt{phase\_incr\_main}, while the ISR continues generating sine samples. It also suggested preventing ADC updates during playback, enabling sound when playback starts, stopping and muting at the end, and keeping the playback index between thread calls. These behaviors appear in the later code.
+
+\textbf{P4. September 10, 2026; time unavailable.}
+
+``Say we were to play this sound 8 times faster, do we just multiply the phase\_incr\_main in phase\_accum\_main += phase\_incr\_main by 8?''
+
+The assistant explained that multiplying the phase increment changes pitch. To shorten the recording instead, it suggested changing the playback delay from 10 ms to 1.25 ms for eightfold speed. Our final code uses 1 ms for nominally tenfold speed, so we adapted the suggestion.
+
+\subsection*{Edit counts}
+
+\begingroup\small
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.2}
+\begin{longtable}{|>{\raggedright\arraybackslash}p{0.08\linewidth}|>{\raggedright\arraybackslash}p{0.15\linewidth}|>{\raggedright\arraybackslash}p{0.19\linewidth}|>{\raggedright\arraybackslash}p{0.19\linewidth}|>{\raggedright\arraybackslash}p{0.19\linewidth}|}
+\hline
+\textbf{Prompt} & \textbf{Edits suggested} & \textbf{Accepted insertions} & \textbf{Accepted deletions} & \textbf{Accepted modifications} \\ \hline
+\endhead
+P1 & 0 & 0 & 0 & 0 \\ \hline
+P2 & 3 & Unverified & Unverified & Unverified \\ \hline
+P3 & 5 & Unverified & Unverified & Unverified \\ \hline
+P4 & 1 & Unverified & Unverified & Unverified \\ \hline
+\end{longtable}
+\endgroup
+
+Most changes were made by hand between reviews. The later code shows which ideas we used, but it does not show exactly how many lines were inserted, deleted, or changed for each prompt. We therefore have not assigned exact accepted-edit counts. Those would require a before-and-after code comparison for each exchange. This selected log also does not provide the full word count requested by the lab.

@@ -1,0 +1,2096 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Lab 1: Birdsong Synthesizer</title><style>body{max-width:1000px;margin:3em auto;padding:0 2em;color:#17212b;font:16px/1.55 Georgia,serif}
+h1,h2,h3{font-family:Arial,sans-serif;color:#123c55;line-height:1.2}h1{margin-top:2em}h2{margin-top:1.7em}
+table{width:100%;border-collapse:collapse;margin:1em 0;font:13px/1.4 Arial,sans-serif;overflow-wrap:anywhere}
+th,td{border:1px solid #bcc7cf;padding:8px;text-align:left;vertical-align:top}th{background:#eaf0f4}
+pre{padding:12px;background:#f3f5f7;white-space:pre-wrap;overflow-wrap:anywhere;font:11px/1.4 Consolas,monospace}
+code{font-family:Consolas,monospace}a{color:#165d87}.item{margin-left:1em}
+@media print{body{margin:0;max-width:none;font-size:11pt}h1{break-before:page}h1:first-of-type{break-before:auto}h2,h3{break-after:avoid}pre{font-size:8pt}a{color:inherit}table{font-size:9pt}}
+</style></head><body><h1>Programmable Birdsong Synthesizer</h1>
+<p>ECE 4760: Laboratory 1   Authors: [GROUP MEMBERS AND NETIDS]   Laboratory dates: [DATES]   Source reviewed: September 20, 2026</p>
+<p><strong>Draft status.</strong> This report documents the saved implementation and the milestones the group reports completing. Numerical values identified as nominal or calculated come from source inspection, not laboratory measurements. Replace bracketed fields and insert the required experimental figures before submission. The demonstrated firmware version and physical wiring must be confirmed by the group.</p>
+<h2>1. Introduction</h2>
+<p>We developed a programmable tone and birdsong synthesizer using a Raspberry Pi Pico 2 build configuration, a slide potentiometer, a matrix keypad, and an SPI digital-to-analog converter. The potentiometer controls a sinusoidal tone over a nominal 0–10 kHz range. The keypad provides muting, storage of nine frequency trajectories, accelerated playback, and entry of a composition whose elements are the stored sounds. A sound can be previewed while entering a composition, making the interface behave like a soundboard.</p>
+<p>The project separates audio generation from user interaction. A timer interrupt generates successive waveform samples using direct digital synthesis (DDS), while cooperative protothreads read the controls, record frequencies, manage playback, and change amplitude. Recording the frequency trajectory rather than the audio waveform lets a small memory buffer represent several seconds of sound. Reading that trajectory ten times faster produces rapid frequency modulation without multiplying the carrier frequency.</p>
+<p>The assignment is the ECE 4760 version of <a href="https://vanhunteradams.com/Pico/Birds/Birdsong.html">Synthesizing Birdsong with the RP2350</a>. Its checkpoints progress from DAC and ADC integration to recording and accelerated composition. The additional ECE 5730 volume-switch extension is outside this report&#x27;s scope.</p>
+<h2>2. Design and Testing Methods</h2>
+<h3>2.1 Incremental development and milestone mapping</h3>
+<p>The repository preserves separate programs for successive stages. These are implementation evidence, rather than independent proof of a successful hardware checkout. The group reports meeting the milestones; checkout dates and observations should be added below.</p>
+<table>
+<tr><th>Checkpoint</th><th>Repository evidence</th><th>Verification or remaining evidence</th></tr>
+<tr><td>Preparation: build course examples</td><td>Pico SDK import and CMake project</td><td>Confirm initial successful build and programming procedure</td></tr>
+<tr><td>Week 1: fixed tone and DAC output</td><td><code>dactest.c</code>: 800 Hz DDS command, channel A</td><td>Scope waveform and audible output; measured frequency [ ]</td></tr>
+<tr><td>Week 1: change DAC channel</td><td><code>dactest_other_channel.c</code>: channel B control word</td><td>Probe B and confirm output moved; observation [ ]</td></tr>
+<tr><td>Week 1: external boot button</td><td>Build links <code>pico_bootsel_via_double_reset</code></td><td>This library does not prove the external button was wired; add circuit/photo and checkout result</td></tr>
+<tr><td>Week 1: potentiometer and ADC</td><td><code>ADC_with_DDS.c</code>: ADC channel 0 mapped to 0–10,000 Hz</td><td>Endpoint/intermediate ADC and frequency measurements [ ]</td></tr>
+<tr><td>Week 2: keypad integration and mute</td><td><code>ADC_DDS_keypad_mute.c</code>: four-state debounce and amplitude ramp</td><td>Repeated press/hold/release test; result [ ]</td></tr>
+<tr><td>Week 2: nine recordings and normal-speed playback</td><td><code>ADC_DDS_keypad_record.c</code>: frequency buffers and 10 ms playback</td><td>Distinct recordings, replacement, hold/release behavior; result [ ]</td></tr>
+<tr><td>Week 2: interrupt timing</td><td>GPIO 2 surrounds synthesis ISR</td><td>High-pulse width and period [ ]</td></tr>
+<tr><td>Week 3: live tone at boot and return via 0</td><td><code>ADC_DDS_keypad_speedup.c</code>: initial tone enabled; mode cancellation on 0</td><td>Startup and mode-transition tests [ ]</td></tr>
+<tr><td>Week 3: accelerated playback</td><td>Final file: 10 ms record, 1 ms playback</td><td>Nominal 10:1; measured duration ratio [ ]</td></tr>
+<tr><td>Week 3: composition and sound previews</td><td>Final file: nine-entry sequence; indirect lookup of stored sound</td><td>Nonconsecutive/repeated-key sequence and interrupted-preview test [ ]</td></tr>
+<tr><td>Week 3: demonstration without restart</td><td>Final state transitions support repeated operation</td><td>Group/TA observation, cardinal imitation, and Merlin result [ ]</td></tr>
+</table>
+<p>Historical programs explain development; only <code>ADC_DDS_keypad_speedup.c</code> is selected by the current CMake target. No claim is made that every historical file represents the exact version demonstrated.</p>
+<h3>2.2 Hardware approach</h3>
+<p>The source configures SPI0 for 16-bit transfers at a requested 20 MHz, with clock polarity and phase both zero. The final program sends the channel-A configuration word followed by a 12-bit DAC code in the same 16-bit frame. The assignment specifies an MCP4822 DAC; the actual installed component should be confirmed against the breadboard. The command uses unity gain and enables the selected channel.</p>
+<p>The slide potentiometer wiper connects to GPIO 26, which is ADC input 0. Its endpoints should connect to the analog supply range and ground so that the wiper remains within the ADC input range. Four keypad rows use GPIO 9–12, and three columns use GPIO 13–15 with internal pull-ups. Each scan drives one row low, waits 1 microsecond, and reads the columns. The code compares the resulting pattern against a lookup table to identify digits, asterisk, and hash.</p>
+<p>The functional block diagram and pin-assignment table give a logical interconnect derived from the program. They are not a substitute for the as-built schematic: DAC latch wiring, supply bypassing, external boot circuitry, audio-jack connections, and any coupling components must be added from the actual setup.</p>
+<p>The hardware photographs document two stages of assembly. The initial setup shows the controller, DAC circuit, audio socket, and oscilloscope probing. The later setup includes the slide potentiometer and telephone-style keypad. The photographs establish the physical arrangement but do not resolve every electrical connection.</p>
+<figure style="break-inside:avoid;margin:1em 0"><img style="width:100%;height:auto" src="figures/dac_breadboard.jpg" alt="Initial DAC and audio-output breadboard setup, including the controller, audio socket, USB connection, and oscilloscope probes. Photograph: IMG_7768."><figcaption>Initial DAC and audio-output breadboard setup, including the controller, audio socket, USB connection, and oscilloscope probes. Photograph: IMG_7768.</figcaption></figure>
+<figure style="break-inside:avoid;margin:1em 0"><img style="width:100%;height:auto" src="figures/keypad_potentiometer_setup.jpg" alt="Integrated synthesizer setup with the slide potentiometer, matrix keypad, controller, and audio-output wiring. Photograph: IMG_7908."><figcaption>Integrated synthesizer setup with the slide potentiometer, matrix keypad, controller, and audio-output wiring. Photograph: IMG_7908.</figcaption></figure>
+<h3>2.3 DDS and amplitude control</h3>
+<p>For ADC code a, the requested frequency is calculated using integer arithmetic:</p>
+<p><code>f_command = floor(a × 10000 / 4095)</code> Hz.</p>
+<p>The requested phase increment is:</p>
+<p><code>Δ = floor(f_command × 2^32 / 50000)</code>.</p>
+<p>At each interrupt, the unsigned 32-bit phase accumulator is advanced by Δ. Overflow naturally wraps the phase. The upper eight bits select one of 256 entries in a sine table initialized with <code>2047 × sin(2πi/256)</code>; the source uses 6.283 as its approximation to 2π. A signed sample is scaled by the amplitude variable before adding a midpoint offset:</p>
+<p><code>DAC_code = 2048 + trunc(sine_table[phase &gt;&gt; 24] × amplitude / 2047)</code>.</p>
+<p>The normal bounds are 1–4095 at full amplitude, with silence represented by a constant midpoint code of 2048. Muting therefore removes the AC waveform; it does not drive the DAC output to zero volts. The phase accumulator keeps advancing while muted.</p>
+<p>Amplitude is clamped between 0 and 2047. The final amplitude thread changes it by 103 and yields for 50 microseconds. A full transition needs 20 updates, giving an approximate 1 ms ramp timescale before scheduling delays. The comment describing 1 ms updates is stale; the earlier mute version did use that slower interval. This envelope applies to playback start/stop transitions, not automatically to every individual element inside a composition.</p>
+<h3>2.4 Recording, playback, and concurrency</h3>
+<p>Five protothreads run on the default core scheduler. Although multicore, DMA, and PIO headers are included, the final application does not launch a second core or use DMA/PIO for synthesis.</p>
+<table>
+<tr><th>Routine</th><th>Role</th><th>Requested yield</th></tr>
+<tr><td><code>protothread_toggle25</code></td><td>Read ADC, print commanded frequency, update live-tone increment when playback is inactive</td><td>10 ms</td></tr>
+<tr><td><code>protothread_core_0</code></td><td>Scan keypad, debounce, dispatch mode actions</td><td>30 ms</td></tr>
+<tr><td><code>protothread_amplitude</code></td><td>Move amplitude toward its enabled/muted target</td><td>50 µs</td></tr>
+<tr><td><code>protothread_playback</code></td><td>Select successive frequencies from an individual sound or composition</td><td>1 ms</td></tr>
+<tr><td><code>protothread_recording</code></td><td>Append frequency values while recording</td><td>10 ms</td></tr>
+<tr><td><code>alarm_irq</code></td><td>Advance DDS and transfer DAC sample</td><td>Nominal 20 µs alarm interval</td></tr>
+</table>
+<p>Recordings use <code>uint16_t sounds[9][1000]</code> and one valid length per sound. Key k maps to row k−1. The sample storage occupies 18,000 bytes and represents nominally ten seconds per key. At 100 Hz, each entry describes the frequency over roughly 10 ms. Playback updates the phase increment every 1 ms, compressing the trajectory to approximately one-tenth its recorded duration. The DAC sample rate remains unchanged, and the stored frequencies are not multiplied by ten.</p>
+<p>The recording thread resets its local write index while idle and updates the selected row&#x27;s length after each write. When the array is full, additional samples are discarded until release. Recordings reside in RAM and are lost on reset or loss of power. A composition stores nine key numbers rather than copying the sound data; consequently, re-recording a key changes the sound referenced by any retained composition.</p>
+<p>The live ADC thread yields ownership of <code>phase_incr_main</code> whenever either playback flag is set. Mode entry cancels competing playback and resets the sequence and sample positions. Key 0 cancels recording/composition/playback and restores the current potentiometer frequency; if no other mode is active, it toggles the live tone. During compose entry, digit presses both append a key number and preview a nonempty sound. The second hash cancels the preview and begins sequence playback from the first entry.</p>
+<h3>2.5 Testing methods and acceptance evidence</h3>
+<p>The following is the verification procedure for this implementation. The supplied photographs document a sinusoidal output and a timing pulse. Other procedures below remain proposed verification tests unless accompanied by the group&#x27;s recorded results.</p>
+<p class="item">1. <strong>DAC and tone calibration.</strong> Run the fixed-tone test on A, then the channel-B variant. Measure frequency, DC midpoint, peak-to-peak amplitude, and waveform shape. In the ADC program, record ADC code and measured frequency at both endpoints and several intermediate positions. At the zero-frequency endpoint, expect a stationary DAC code rather than a periodic waveform.</p>
+<p class="item">2. <strong>Debounce and mode entry.</strong> Hold 0 through several scans and verify exactly one action. Repeat with deliberately slow releases and with asterisk/hash. Observe whether the action occurs on press or release. Verify that the current program acts on confirmed press even though comments describe release.</p>
+<p class="item">3. <strong>Recording isolation.</strong> Store distinguishable sweeps on keys 1, 5, and 9; replay each; overwrite key 5 with a shorter trajectory; confirm the others are unchanged and no old tail remains. Test a long hold at the capacity limit and a very short hold.</p>
+<p class="item">4. <strong>Speed measurement.</strong> Record a trajectory containing identifiable frequency transitions. Measure its recording interval and the corresponding playback interval, then calculate <code>S = T_record / T_play</code>. Repeat to estimate variation; compare S with the requested 8–10 range. Keep serial-output conditions the same as during the demonstration.</p>
+<p class="item">5. <strong>Composition.</strong> Enter a nonconsecutive sequence such as 9, 1, 9, 5. Verify each preview and the final ordering. Start sequence playback while a preview is still active. Interrupt the sequence with a soundboard key, then test return via 0 and entry via asterisk/hash without resetting the board. Test empty slots, an empty composition, and a tenth sequence entry.</p>
+<p class="item">6. <strong>Audio quality and timing.</strong> Capture a complete programmed sweep with its amplitude envelope. Measure rise, sustain, and fall times and inspect any discontinuity at sequence boundaries. Probe GPIO 2 for ISR high time and repetition period under normal and heavy keypad/serial activity. Capture audio for a spectrogram and compare the frequency trajectory with the intended birdcall.</p>
+<p>For each frequency point, report signed error <code>f_measured − f_command</code> and percentage error for nonzero commands. Report instrument resolution or cursor uncertainty. For speed ratio uncertainty, independent duration uncertainties can be propagated as <code>σS/S ≈ sqrt((σTr/Tr)^2 + (σTp/Tp)^2)</code>. Do not assign an error bar solely from software resolution.</p>
+<h3>2.6 Use of AI</h3>
+<p>We used an AI coding assistant through an iterative dialogue to explain DDS amplitude and frequency control, inspect the debounce state machine, compare code with the lab behavior, and suggest implementations for recording and composition. The conversation records advice about missing switch breaks, array bounds and lengths, frequency-versus-phase-increment storage, playback timing, ADC ownership during playback, sequence indexing, and mode reset behavior. The group repeatedly requested reviews without file changes and made subsequent revisions themselves.</p>
+<p>One visible assistant edit changed an earlier keypad source to shorten the fade, relocate its toggle to a release transition, register the keypad/amplitude threads, and remove an undefined LED reference. Later revisions do not retain every suggestion: the final source still dispatches control actions on confirmed press. Code visible in the final file supports adoption of several other suggestions, including fixed-size frequency buffers, bounded amplitude updates, sequence indirection, and the key-0 return-to-tone behavior.</p>
+<p>AI output was treated as a proposal to inspect, not experimental evidence. No scope timings, spectral measurements, successful identification results, or acceptance statistics were invented. Appendix B records the available provenance and the limitations of reconstructing a complete prompt log. The group must verify this disclosure and supply the full exported dialogue for the required audit.</p>
+<h2>3. Documentation</h2>
+<h3>3.1 Logical wiring and signal flow</h3>
+<figure style="break-inside:avoid;margin:1em 0"><img style="width:100%;height:auto" src="figures/signal_flow.png" alt="Functional signal flow derived from the saved implementation. Dashed arrows indicate control or timing signals; this is not an as-built wiring schematic."><figcaption>Functional signal flow derived from the saved implementation. Dashed arrows indicate control or timing signals; this is not an as-built wiring schematic.</figcaption></figure>
+<table>
+<tr><th>Pico signal</th><th>Program assignment</th><th>External connection / confirmation</th></tr>
+<tr><td>GPIO 5</td><td>SPI0 chip select</td><td>DAC active-low CS</td></tr>
+<tr><td>GPIO 6</td><td>SPI0 clock</td><td>DAC SCK</td></tr>
+<tr><td>GPIO 7</td><td>SPI0 transmit</td><td>DAC SDI</td></tr>
+<tr><td>GPIO 4</td><td>SPI0 receive function configured</td><td>No DAC read transaction is used</td></tr>
+<tr><td>GPIO 26</td><td>ADC0</td><td>Potentiometer wiper</td></tr>
+<tr><td>GPIO 9–12</td><td>Row outputs</td><td>Keypad rows; confirm connector order</td></tr>
+<tr><td>GPIO 13–15</td><td>Pulled-up column inputs</td><td>Keypad columns; confirm connector order</td></tr>
+<tr><td>GPIO 2</td><td>ISR timing output</td><td>Scope probe</td></tr>
+<tr><td>GPIO 25</td><td>LED toggle output</td><td>Code assignment; board-specific LED behavior is not verification of audio</td></tr>
+<tr><td>Supply and ground</td><td>Not established by C source</td><td>Add actual DAC, potentiometer, and shared-ground wiring</td></tr>
+<tr><td>DAC latch, audio socket, boot button</td><td>Not established by C source</td><td>Add actual connections and any component values</td></tr>
+</table>
+<figure style="break-inside:avoid;margin:1em 0"><img style="width:100%;height:auto" src="figures/debounce_state_machine.png" alt="Four-state keypad debounce diagram supplied by the group. The action on confirmed press matches the saved implementation; recording ends on confirmed release."><figcaption>Four-state keypad debounce diagram supplied by the group. The action on confirmed press matches the saved implementation; recording ends on confirmed release.</figcaption></figure>
+<p>Because the keypad thread yields between scans and every switch case ends with a break, a single observation cannot pass through all debounce states. The remembered key identifies the recording to stop after the raw input no longer names that key. A different valid key is treated as loss of the previous key; this is a single-key interface, not a general multi-key rollover implementation.</p>
+<h3>3.2 Reproduction and program listings</h3>
+<p>The current build selects <code>ADC_DDS_keypad_speedup.c</code> in target <code>Audio_Timer_Interrupt_DDS</code>, with <code>PICO_BOARD</code> set to <code>pico2</code>. The CMake configuration names SDK 2.3.0 and toolchain 15_2_Rel1 and includes the local <code>pt_cornell_rp2040_v1_4.h</code>. Reproduction requires the SDK import file, the matching SDK/toolchain setup, the protothreads header, and the selected application source. Configure and build using the Pico extension or the existing CMake workflow, then program the generated UF2 using the board&#x27;s bootloader procedure. Confirm the actual board and tool versions used during checkout.</p>
+<p>Appendix A is a complete, source-preserving listing of all six C files and CMake configuration, with explanatory annotations added only to the documentation. It includes an inventory and hashes so later code changes can be distinguished from this report&#x27;s snapshot. The application files were not edited to prepare this report.</p>
+<h2>4. Results</h2>
+<h3>4.1 Source-derived performance</h3>
+<table>
+<tr><th>Quantity</th><th>Calculated or configured value</th><th>Interpretation</th></tr>
+<tr><td>Audio sample rate</td><td>50,000 samples/s nominal</td><td>Set by 20 µs alarm delay; actual period needs measurement</td></tr>
+<tr><td>Frequency command range</td><td>0–10,000 Hz</td><td>Integer mapping from ADC code</td></tr>
+<tr><td>Mean frequency-command spacing</td><td>10,000/4095 ≈ 2.442 Hz per ADC code</td><td>Actual adjacent integer commands differ by 2 or 3 Hz</td></tr>
+<tr><td>DDS increment resolution</td><td>50,000/2^32 ≈ 0.00001164 Hz</td><td>Ideal digital tuning granularity, not measured accuracy</td></tr>
+<tr><td>Sine table</td><td>256 entries</td><td>Phase index resolution 1.40625°</td></tr>
+<tr><td>Record interval</td><td>10 ms nominal</td><td>Approximately 100 frequency entries/s</td></tr>
+<tr><td>Playback interval</td><td>1 ms nominal</td><td>Approximately 10× trajectory speed</td></tr>
+<tr><td>Per-key recording limit</td><td>1,000 entries</td><td>Approximately 10 s recorded / 1 s accelerated</td></tr>
+<tr><td>Frequency storage</td><td>18,000 bytes</td><td>Nine arrays of 1,000 unsigned 16-bit values</td></tr>
+<tr><td>Composition capacity</td><td>Nine entries</td><td>Repetitions allowed; no entry timestamps stored</td></tr>
+<tr><td>Fade timescale</td><td>Approximately 1 ms</td><td>20 updates with 50 µs yields; timing varies</td></tr>
+<tr><td>SPI frame wire time</td><td>16 / 20 MHz = 0.8 µs nominal</td><td>Excludes software and interrupt overhead</td></tr>
+</table>
+<p>The interrupt rearms the alarm relative to the timer value read inside the ISR. Interrupt-entry and pre-rearm latency therefore contribute to the effective sample period. DDS uses the nominal 50 kHz constant, so any measured sample-rate error proportionally changes the generated frequency. Similarly, thread yields specify waiting intervals, not guaranteed sampling deadlines. The enabled frequency printout can add scheduling delay. These effects prevent claiming exact 10× speed or exact pitch from source alone.</p>
+<h3>4.2 Experimental observations and remaining measurements</h3>
+<table>
+<tr><th>Measurement</th><th>Observed value</th><th>Uncertainty / evidence</th></tr>
+<tr><td>Fixed-tone waveform</td><td>Scope displays 800.000 Hz</td><td>IMG_7767; DAC output channel and instrument uncertainty not documented</td></tr>
+<tr><td>Potentiometer minimum/maximum frequency</td><td>[MEASURE]</td><td>[ADC codes and scope resolution]</td></tr>
+<tr><td>Largest frequency error over tested points</td><td>[MEASURE]</td><td>[Number/range of points]</td></tr>
+<tr><td>Timing-pulse high interval</td><td>Cursor separation 1.63 µs</td><td>IMG_7909; one capture, not a worst-case timing bound</td></tr>
+<tr><td>Timing-trace repetition</td><td>Scope displays 50.0000 kHz, corresponding to 20.0 µs</td><td>IMG_7909; period inferred from displayed frequency</td></tr>
+<tr><td>Record/playback duration ratio</td><td>[MEASURE]</td><td>[Repeated trials and variation]</td></tr>
+<tr><td>Envelope rise / sustain / fall</td><td>[MEASURE]</td><td>[Scope figure]</td></tr>
+<tr><td>Debounce reliability and mode cycling</td><td>[OBSERVATION]</td><td>[Test count and failures]</td></tr>
+<tr><td>Cardinal imitation / Merlin outcome</td><td>[OBSERVATION]</td><td>[Spectrogram and demo notes]</td></tr>
+</table>
+<p>The fixed-tone photograph shows a sinusoidal waveform with an 800.000 Hz frequency readout. The displayed scales are 500 mV/division and 400 µs/division. This is consistent with the 800 Hz baseline program. The photo does not establish which DAC output was probed, and the readout precision is not an uncertainty estimate or proof of zero frequency error.</p>
+<figure style="break-inside:avoid;margin:1em 0"><img style="width:100%;height:auto" src="figures/tone_800hz.jpg" alt="Fixed-tone oscilloscope observation: sinusoidal output with an 800.000 Hz readout, 500 mV/division vertical scale, and 400 µs/division horizontal scale. Photograph: IMG_7767."><figcaption>Fixed-tone oscilloscope observation: sinusoidal output with an 800.000 Hz readout, 500 mV/division vertical scale, and 400 µs/division horizontal scale. Photograph: IMG_7767.</figcaption></figure>
+<p>The timing photograph shows a high pulse bounded by cursors at approximately -48.0 ns and 1.58 µs; the instrument reports a 1.63 µs separation. The displayed frequency is 50.0000 kHz. Interpreting this as the GPIO 2 ISR instrumentation gives an instrumented-body occupancy of approximately 1.63/20.0 = 8.15%. This interpretation is consistent with the timing code, but the photograph alone does not identify the probe connection or firmware version. The observation is a single captured interval, not a measured maximum across operating conditions. Interrupt overhead outside the GPIO writes is excluded.</p>
+<figure style="break-inside:avoid;margin:1em 0"><img style="width:100%;height:auto" src="figures/isr_timing.jpg" alt="Timing-pulse oscilloscope capture with a 1.63 µs cursor separation and a 50.0000 kHz frequency readout. Horizontal scale: 400 ns/division. Photograph: IMG_7909."><figcaption>Timing-pulse oscilloscope capture with a 1.63 µs cursor separation and a 50.0000 kHz frequency readout. Horizontal scale: 400 ns/division. Photograph: IMG_7909.</figcaption></figure>
+<p><strong>Required envelope evidence:</strong> [INSERT OSCILLOSCOPE CAPTURE of a complete generated sweep/chirp, labeling rise, sustain, fall, voltage scale, and time scale. The fixed-tone trace above does not show this envelope.]</p>
+<p><strong>Required spectrogram:</strong> [INSERT SPECTROGRAM of this device&#x27;s audio, with time/frequency axes, recording method, and analysis settings.]</p>
+<h3>4.3 Limitations visible in the submitted snapshot</h3>
+<p>Control actions are dispatched on confirmed press, despite the source comment and the requested press/release phrasing. Recording starts in the next held-key scan, introducing an extra scan interval after press confirmation, and stops after release confirmation. Short holds may not create new samples. The preserved write-length scheme does not explicitly clear the old slot length at the start of a new recording; a replacement that captures no samples can leave the previous sound intact.</p>
+<p>The composition playback routine spends a separate iteration advancing between entries. During that roughly 1 ms interval, the DDS retains the previous frequency. Empty entries also consume an iteration, and an all-empty composition can briefly enable output at a stale frequency. The sequence-entry path accepts empty keys even though individual playback rejects them. A composition stores order only; pauses between the user&#x27;s key presses are not recorded. Silence must be represented deliberately rather than inferred from entry timing.</p>
+<p>Amplitude remains enabled between composition elements, so there is no independent attack/release envelope on each stored element. At the end of playback, clearing the playback flag lets the ADC thread regain frequency control before the fade necessarily finishes. These are identifiable limitations to compare with the scope and spectrogram, not measured claims that audible artifacts occurred.</p>
+<h2>5. Conclusions</h2>
+<p>The saved implementation provides a compact architecture for a programmable birdsong instrument: a timer-driven DDS engine, low-rate frequency storage, accelerated replay, and a keypad composition interface. Separate source versions make the progression from basic DAC output to interactive synthesis reproducible. Previewing sounds during composition and using key 0 to return to the potentiometer reduce the need to reset or reprogram the board during use.</p>
+<p>The principal engineering tradeoff is between simplicity and timing precision. Cooperative threads simplify control logic, but their requested intervals do not guarantee exact playback speed. Finite arrays avoid allocation complexity while limiting both sound duration and composition length. Boolean mode flags are workable when consistently reset, but an explicit mode enumeration and centralized transition functions would make future changes easier to verify.</p>
+<p>Further improvements would include deadline-based frequency updates, suppression or throttling of diagnostic prints during timing measurements, explicit handling of empty/full buffers, and defined transitions between successive sound envelopes. The supplied photographs support baseline sinusoidal output and a short timing-pulse interval. A completed evaluation still requires the envelope capture, spectrogram, additional timing trials, and demonstration results; the available evidence does not establish full checkpoint compliance.</p>
+<h2>6. Lab-Specific Deliverables and Questions</h2>
+<p>The current lab page does not give a separate numbered theory-question list. Its report-specific deliverables are the envelope scope capture, a generated-audio spectrogram, a commented program listing, and an AI prompt log with exchange and change counts. The results section includes the fixed-tone and timing photographs and identifies the envelope and spectrogram evidence still needed; Appendix A supplies the annotated listing; Appendix B supplies a partial AI provenance record and identifies the missing full export. <a href="https://vanhunteradams.com/Pico/Birds/Birdsong.html">Lab report instructions</a>.</p>
+<p>For the timing question, compute interrupt occupancy from measured values as <code>100 × ISR_high_time / measured_period</code>. Report that the GPIO pulse omits overhead outside the instrumentation. For the acceleration question, use the measured duration ratio rather than multiplying the DDS phase increment. For the storage question, 100 Hz frequency storage is sufficient for the deliberately slow input trajectory and uses 1/500 the samples of 50 kHz waveform storage at equal sample width.</p>
+<p>The example reports informed organization only: an explanation of design choices, diagrams linked to software, explicit testing methods, measured results, and a code appendix. Their hardware, experiments, measurements, and conclusions were not reused as this group&#x27;s results. References: <a href="https://vanhunteradams.com/Pico/CourseMaterials/Birdsong.pdf">Birdsong</a>, <a href="https://vanhunteradams.com/Pico/CourseMaterials/Birdsong2.pdf">Birdsong2</a>, <a href="https://vanhunteradams.com/Pico/CourseMaterials/cricket.pdf">Cricket</a>, and <a href="https://vanhunteradams.com/Pico/CourseMaterials/reaction.pdf">Reaction</a>.</p>
+<h2>Submission Completion Checklist</h2>
+<p class="item">- Insert group names, dates, actual board identification, and demonstrated source version.</p>
+<p class="item">- Add the as-built schematic, including latch, power, boot button, and audio connections.</p>
+<p class="item">- Replace experimental placeholders with recorded results, not nominal values.</p>
+<p class="item">- Add the waveform/envelope figure and spectrogram; confirm the probe connection and firmware used for the supplied timing trace.</p>
+<p class="item">- Confirm checkpoint/demo outcomes and any Merlin identification result.</p>
+<p class="item">- Export the complete AI conversation, reconcile suggested/accepted change counts, and attach it with Appendix B.</p>
+<p class="item">- Reconcile the documented implementation limitations with the version actually demonstrated.</p>
+<h1>Appendix B: AI Use and Prompt Provenance</h1>
+<p><strong>Status: partial reconstruction, not a complete transcript.</strong> This appendix is based on the available code-development conversation. It must accompany, not replace, an export of the complete user/assistant dialogue. Exact total words exchanged and total additions/deletions/modifications suggested and accepted cannot be established from source snapshots alone. Repeated advice, manual edits, and the difference between an accepted idea and accepted code lines prevent a defensible exact total.</p>
+<h2>Scope and counting convention</h2>
+<p>The table below counts design-change categories, not code lines or individual suggestion events. It is a qualitative adoption audit. It is not presented as the numeric accounting required by the lab. The group should state whether tool activity is included when computing final transcript totals.</p>
+<table>
+<tr><th>Change category discussed with AI</th><th>Evidence in the final source</th></tr>
+<tr><td>Add breaks and correct debounce state typo</td><td>Cases contain breaks and valid states</td></tr>
+<tr><td>Dispatch actions once rather than repeatedly while held</td><td>Most actions occur on confirmed press</td></tr>
+<tr><td>Move control actions to confirmed release</td><td>Not adopted in the reviewed final source</td></tr>
+<tr><td>Scale signed sine samples before adding midpoint</td><td>Present in ISR</td></tr>
+<tr><td>Shorten fade with bounded increments</td><td>Step 103, clamped endpoints; final yield 50 µs</td></tr>
+<tr><td>Register control, amplitude, recording, playback threads</td><td>Five threads registered</td></tr>
+<tr><td>Use fixed frequency buffers with valid lengths</td><td>Nine 1,000-entry uint16_t arrays</td></tr>
+<tr><td>Store Hz rather than a truncated phase increment</td><td>ADC-to-Hz map stored in recording thread</td></tr>
+<tr><td>Compress frequency update interval for speedup</td><td>Record 10 ms; playback 1 ms</td></tr>
+<tr><td>Prevent ADC overwrites during all playback</td><td>Both playback flags guard live updates</td></tr>
+<tr><td>Index composed sounds through recorded key sequence</td><td>compose_sequence[current_button] - 1</td></tr>
+<tr><td>Cancel competing playback and reset indices</td><td>Present on principal mode transitions</td></tr>
+<tr><td>Return to live tone through key 0</td><td>Mode cancellation and immediate phase update present</td></tr>
+<tr><td>Reject empty individual playback</td><td>Length check present</td></tr>
+<tr><td>Reject empty composition entries / avoid boundary delay</td><td>Not implemented in reviewed snapshot</td></tr>
+</table>
+<p>No numeric accepted-change total is inferred from this table. Similar code does not prove which exact suggested lines the students accepted. A visible earlier tool edit did make changes to an earlier <code>ADC_DDS_keypad.c</code>; that file is not among the current source snapshots. Its changes concerned fade speed, release action, thread registration, and an undefined LED reference.</p>
+<h2>Selected exact user prompts and response summaries</h2>
+<p>The quotations below preserve selected user wording, including spelling, but omit IDE/environment boilerplate. Assistant responses are summaries, not verbatim transcripts. The complete export must preserve both sides&#x27; actual words to satisfy the prompt-log requirement.</p>
+<table>
+<tr><th>Selected user prompt</th><th>Assistant response summary</th></tr>
+<tr><td>&quot;what variable controls to amplitude of sine wave?&quot;</td><td>Identified sine-table scale, phase increment, and DAC midpoint roles</td></tr>
+<tr><td>&quot;can we control the amplitude as we write to the dac instead of the sine table?&quot;</td><td>Proposed scaling the signed sample before adding midpoint</td></tr>
+<tr><td>&quot;will the current code work?&quot;</td><td>Reviewed thread registration, LED naming, startup state, and fade duration</td></tr>
+<tr><td>&quot;can you check this version to see if it meets the requiremts, if you would change anything let us know. do not make any changes yourself&quot;</td><td>Reviewed recording reachability, sample representation, indexing, and build selection</td></tr>
+<tr><td>&quot;OKay check now. Does this fix this issues&quot;</td><td>Identified missing semicolon, invalid recording keys, and idle muting</td></tr>
+<tr><td>&quot;okay check now&quot;</td><td>Rechecked mode handling and playback reset behavior</td></tr>
+<tr><td>&quot;okay check now, offer soluiton suggetsed on ant problems, except number 3. dont change any files&quot;</td><td>Supplied scoped playback and release-transition suggestions</td></tr>
+<tr><td>&quot;Say we were to play this sound 8 times faster, do we just multiply the phase_incr_main in phase_accum_main += phase_incr_main by 8?&quot;</td><td>Distinguished faster trajectory traversal from pitch multiplication</td></tr>
+<tr><td>&quot;check now, find any more problems if any, also check if modes get properly reset. in compose mode we do want sounds to play whe  we hit button just like a soundboard&quot;</td><td>Preserved compose previews and examined reset conflicts and sequence indexing</td></tr>
+<tr><td>&quot;check for any more logical errors&quot;</td><td>Reviewed sequence interruption, empty recordings, and boundary timing</td></tr>
+<tr><td>&quot;Yes so we want key 0 to bring us back to playing tone from potentiometer, in tone generator mode:&quot;</td><td>Proposed cancelling other modes and restoring the ADC-derived increment</td></tr>
+</table>
+<p>Additional visible exchanges covered the initial state-machine diagram, semaphore versus shared-flag design, recording arrays, and DAC/IRQ playback behavior. They are not reproduced as an invented complete transcript here.</p>
+<h2>Required final accounting</h2>
+<table>
+<tr><th>Required item</th><th>Current status</th></tr>
+<tr><td>Complete prompts and assistant responses</td><td>Attach full conversation export</td></tr>
+<tr><td>Number of words exchanged</td><td>Not available; compute from that export with a stated rule</td></tr>
+<tr><td>Additions suggested / accepted</td><td>Not established; reconcile proposals and accepted diffs</td></tr>
+<tr><td>Deletions suggested / accepted</td><td>Not established; reconcile proposals and accepted diffs</td></tr>
+<tr><td>Modifications suggested / accepted</td><td>Not established; reconcile proposals and accepted diffs</td></tr>
+<tr><td>AI-generated experimental measurements</td><td>None</td></tr>
+</table>
+<p>For reproducible counts, decide whether an addition/deletion means a source line or a logical change. Count replacements consistently, avoid counting the same repeated proposal as several accepted changes, and retain dated source diffs if available. This appendix deliberately does not substitute an unsupported estimate for the required counts.</p>
+<h1>Appendix A: Annotated Source Snapshot</h1>
+<p>Snapshot date: September 20, 2026. Original application files are unchanged. Comments marked REPORT NOTE were inserted only in the final-source listing below. Other source text is preserved. These notes explain behavior, not implemented fixes.</p>
+<table>
+<tr><th>File</th><th>SHA-256 of original bytes</th></tr>
+<tr><td>dactest.c</td><td>cc4bc1069280c53bd303e90ed557e279c2094c1c9d0648b568e8e1117b79701e</td></tr>
+<tr><td>dactest_other_channel.c</td><td>db55fd5c39fc7d93591a67f3af02b89bf2e392f994765fd3cda78612e6356906</td></tr>
+<tr><td>ADC_with_DDS.c</td><td>3fc01390cb1ba028b35a32cbb4d661edfecb50ade77d1f5c9b18ae416890af19</td></tr>
+<tr><td>ADC_DDS_keypad_mute.c</td><td>669d9393b6a637c8b51e0ce2d6ae9fc89231432dbc44c26fcb4d360034178846</td></tr>
+<tr><td>ADC_DDS_keypad_record.c</td><td>6ea0fd24342e753c004fb8e74a9a648411303fd9e9ab400118e07ef4037f6c55</td></tr>
+<tr><td>ADC_DDS_keypad_speedup.c</td><td>bb1a61ee89eeca9226ba5d9b1199d1cd2c6f6714c88119244d862d7483b6ac75</td></tr>
+<tr><td>CMakeLists.txt</td><td>abbacbd8c017fe768584f6b78d768bbd91732b4158c4b4a4c254a1e04fd141c6</td></tr>
+</table>
+<h2>dactest.c</h2>
+<p>Week 1 baseline: a fixed 800 Hz phase increment feeds channel A. The timer ISR performs the table lookup and SPI write.</p>
+<pre><code>/**
+ * V. Hunter Adams
+ * DDS of sine wave on MCP4822 DAC w/ ISR
+ * 
+ * Modified example code from Raspberry Pi
+ * Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
+ *
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+   GPIO 5 (pin 7) Chip select
+   GPIO 6 (pin 9) SCK/spi0_sclk
+   GPIO 7 (pin 10) MOSI/spi0_tx
+   GPIO 2 (pin 4) GPIO output for timing ISR
+   3.3v (pin 36) -&gt; VCC on DAC 
+   GND (pin 3)  -&gt; GND on DAC 
+ */
+
+#include &lt;stdio.h&gt;
+#include &lt;math.h&gt;
+#include &quot;pico/stdlib.h&quot;
+#include &quot;hardware/timer.h&quot;
+#include &quot;hardware/irq.h&quot;
+#include &quot;hardware/spi.h&quot;
+
+// Low-level alarm infrastructure we&#x27;ll be using
+#define ALARM_NUM 0
+#define ALARM_IRQ timer_hardware_alarm_get_irq_num(timer_hw, ALARM_NUM)
+
+//DDS parameters
+#define two32 4294967296.0 // 2^32 
+#define Fs 50000
+#define DELAY 20 // 1/Fs (in microseconds)
+// the DDS units:
+volatile unsigned int phase_accum_main;
+volatile unsigned int phase_incr_main = (800.0*two32)/Fs ;
+
+// SPI data
+uint16_t DAC_data ; // output value
+
+//DAC parameters
+// A-channel, 1x, active
+#define DAC_config_chan_A 0b0011000000000000
+// B-channel, 1x, active
+#define DAC_config_chan_B 0b1011000000000000
+
+//SPI configurations
+#define PIN_MISO 4
+#define PIN_CS   5
+#define PIN_SCK  6
+#define PIN_MOSI 7
+#define SPI_PORT spi0
+
+//GPIO for timing the ISR
+#define ISR_GPIO 2
+
+// DDS sine table
+#define sine_table_size 256
+volatile int sin_table[sine_table_size] ;
+
+// Alarm ISR
+static void alarm_irq(void) {
+
+    // Assert a GPIO when we enter the interrupt
+    gpio_put(ISR_GPIO, 1) ;
+
+    // Clear the alarm irq
+    hw_clear_bits(&amp;timer_hw-&gt;intr, 1u &lt;&lt; ALARM_NUM);
+
+    // Reset the alarm register
+    timer_hw-&gt;alarm[ALARM_NUM] = timer_hw-&gt;timerawl + DELAY ;
+
+	// DDS phase and sine table lookup
+	phase_accum_main += phase_incr_main  ;
+    DAC_data = (DAC_config_chan_A | ((sin_table[phase_accum_main&gt;&gt;24] + 2048) &amp; 0xffff))  ;
+
+    // Perform an SPI transaction
+    spi_write16_blocking(SPI_PORT, &amp;DAC_data, 1) ;
+
+    // De-assert the GPIO when we leave the interrupt
+    gpio_put(ISR_GPIO, 0) ;
+
+}
+
+int main() {
+    // Initialize stdio
+    stdio_init_all();
+    printf(&quot;Hello, DAC!\n&quot;);
+
+    // Initialize SPI channel (channel, baud rate set to 20MHz)
+    spi_init(SPI_PORT, 20000000) ;
+    // Format (channel, data bits per transfer, polarity, phase, order)
+    spi_set_format(SPI_PORT, 16, 0, 0, 0);
+
+    // Setup the ISR-timing GPIO
+    gpio_init(ISR_GPIO) ;
+    gpio_set_dir(ISR_GPIO, GPIO_OUT);
+    gpio_put(ISR_GPIO, 0) ;
+
+    // Map SPI signals to GPIO ports
+    gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
+    gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
+    gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
+    gpio_set_function(PIN_CS, GPIO_FUNC_SPI) ;
+
+    // === build the sine lookup table =======
+   	// scaled to produce values between 0 and 4096
+    int ii;
+    for (ii = 0; ii &lt; sine_table_size; ii++){
+         sin_table[ii] = (int)(2047*sin((float)ii*6.283/(float)sine_table_size));
+    }
+
+    // Enable the interrupt for the alarm (we&#x27;re using Alarm 0)
+    hw_set_bits(&amp;timer_hw-&gt;inte, 1u &lt;&lt; ALARM_NUM) ;
+    // Associate an interrupt handler with the ALARM_IRQ
+    irq_set_exclusive_handler(ALARM_IRQ, alarm_irq) ;
+    // Enable the alarm interrupt
+    irq_set_enabled(ALARM_IRQ, true) ;
+    // Write the lower 32 bits of the target time to the alarm register, arming it.
+    timer_hw-&gt;alarm[ALARM_NUM] = timer_hw-&gt;timerawl + DELAY ;
+
+    // Nothing happening here
+    while(1){
+    }
+    return 0;
+}</code></pre>
+<h2>dactest_other_channel.c</h2>
+<p>Week 1 channel experiment: the DAC control word selects B rather than A. The DDS frequency remains 800 Hz.</p>
+<pre><code>/**
+ * V. Hunter Adams
+ * DDS of sine wave on MCP4822 DAC w/ ISR
+ * 
+ * Modified example code from Raspberry Pi
+ * Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
+ *
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+   GPIO 5 (pin 7) Chip select
+   GPIO 6 (pin 9) SCK/spi0_sclk
+   GPIO 7 (pin 10) MOSI/spi0_tx
+   GPIO 2 (pin 4) GPIO output for timing ISR
+   3.3v (pin 36) -&gt; VCC on DAC 
+   GND (pin 3)  -&gt; GND on DAC 
+ */
+
+#include &lt;stdio.h&gt;
+#include &lt;math.h&gt;
+#include &quot;pico/stdlib.h&quot;
+#include &quot;hardware/timer.h&quot;
+#include &quot;hardware/irq.h&quot;
+#include &quot;hardware/spi.h&quot;
+
+// Low-level alarm infrastructure we&#x27;ll be using
+#define ALARM_NUM 0
+#define ALARM_IRQ timer_hardware_alarm_get_irq_num(timer_hw, ALARM_NUM)
+
+//DDS parameters
+#define two32 4294967296.0 // 2^32 
+#define Fs 50000
+#define DELAY 20 // 1/Fs (in microseconds)
+// the DDS units:
+volatile unsigned int phase_accum_main;
+volatile unsigned int phase_incr_main = (800.0*two32)/Fs ;
+
+// SPI data
+uint16_t DAC_data ; // output value
+
+//DAC parameters
+// A-channel, 1x, active
+#define DAC_config_chan_A 0b0011000000000000
+// B-channel, 1x, active
+#define DAC_config_chan_B 0b1011000000000000
+
+//SPI configurations
+#define PIN_MISO 4
+#define PIN_CS   5
+#define PIN_SCK  6
+#define PIN_MOSI 7
+#define SPI_PORT spi0
+
+//GPIO for timing the ISR
+#define ISR_GPIO 2
+
+// DDS sine table
+#define sine_table_size 256
+volatile int sin_table[sine_table_size] ;
+
+// Alarm ISR
+static void alarm_irq(void) {
+
+    // Assert a GPIO when we enter the interrupt
+    gpio_put(ISR_GPIO, 1) ;
+
+    // Clear the alarm irq
+    hw_clear_bits(&amp;timer_hw-&gt;intr, 1u &lt;&lt; ALARM_NUM);
+
+    // Reset the alarm register
+    timer_hw-&gt;alarm[ALARM_NUM] = timer_hw-&gt;timerawl + DELAY ;
+
+	// DDS phase and sine table lookup
+	phase_accum_main += phase_incr_main  ;
+    DAC_data = (DAC_config_chan_B | ((sin_table[phase_accum_main&gt;&gt;24] + 2048) &amp; 0xffff))  ;
+
+    // Perform an SPI transaction
+    spi_write16_blocking(SPI_PORT, &amp;DAC_data, 1) ;
+
+    // De-assert the GPIO when we leave the interrupt
+    gpio_put(ISR_GPIO, 0) ;
+
+}
+
+int main() {
+    // Initialize stdio
+    stdio_init_all();
+    printf(&quot;Hello, DAC!\n&quot;);
+
+    // Initialize SPI channel (channel, baud rate set to 20MHz)
+    spi_init(SPI_PORT, 20000000) ;
+    // Format (channel, data bits per transfer, polarity, phase, order)
+    spi_set_format(SPI_PORT, 16, 0, 0, 0);
+
+    // Setup the ISR-timing GPIO
+    gpio_init(ISR_GPIO) ;
+    gpio_set_dir(ISR_GPIO, GPIO_OUT);
+    gpio_put(ISR_GPIO, 0) ;
+
+    // Map SPI signals to GPIO ports
+    gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
+    gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
+    gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
+    gpio_set_function(PIN_CS, GPIO_FUNC_SPI) ;
+
+    // === build the sine lookup table =======
+   	// scaled to produce values between 0 and 4096
+    int ii;
+    for (ii = 0; ii &lt; sine_table_size; ii++){
+         sin_table[ii] = (int)(2047*sin((float)ii*6.283/(float)sine_table_size));
+    }
+
+    // Enable the interrupt for the alarm (we&#x27;re using Alarm 0)
+    hw_set_bits(&amp;timer_hw-&gt;inte, 1u &lt;&lt; ALARM_NUM) ;
+    // Associate an interrupt handler with the ALARM_IRQ
+    irq_set_exclusive_handler(ALARM_IRQ, alarm_irq) ;
+    // Enable the alarm interrupt
+    irq_set_enabled(ALARM_IRQ, true) ;
+    // Write the lower 32 bits of the target time to the alarm register, arming it.
+    timer_hw-&gt;alarm[ALARM_NUM] = timer_hw-&gt;timerawl + DELAY ;
+
+    // Nothing happening here
+    while(1){
+    }
+    return 0;
+}</code></pre>
+<h2>ADC_with_DDS.c</h2>
+<p>Week 1 integration: the ADC thread converts a potentiometer code to Hz, then to a phase increment. The timer ISR independently emits audio samples.</p>
+<pre><code>
+/*
+Simple ADC/Protothreads demo
+
+Schedules a single thread, reads/prints ADC value
+
+ */
+
+#include &quot;hardware/gpio.h&quot;
+#include &quot;hardware/timer.h&quot;
+#include &quot;hardware/adc.h&quot;
+#include &quot;pico/stdlib.h&quot;
+#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+#include &quot;stdlib.h&quot;
+#include &quot;hardware/spi.h&quot;
+#include &lt;math.h&gt;
+#include &quot;hardware/irq.h&quot;
+
+// ==========================================
+// === protothreads globals
+// ==========================================
+// protothreads header
+#include &quot;pt_cornell_rp2040_v1_4.h&quot;
+
+#define LED_PIN 25
+#define ADC_PIN 26
+#define ADC_MUX 0
+
+// Low-level alarm infrastructure we&#x27;ll be using
+#define ALARM_NUM 0
+#define ALARM_IRQ timer_hardware_alarm_get_irq_num(timer_hw, ALARM_NUM)
+
+//DDS parameters
+#define two32 4294967296.0 // 2^32 
+#define Fs 50000
+#define DELAY 20 // 1/Fs (in microseconds)
+// the DDS units:
+volatile unsigned int phase_accum_main;
+volatile unsigned int phase_incr_main;
+
+// SPI data
+uint16_t DAC_data ; // output value
+
+//DAC parameters
+// A-channel, 1x, active
+#define DAC_config_chan_A 0b0011000000000000
+// B-channel, 1x, active
+#define DAC_config_chan_B 0b1011000000000000
+
+//SPI configurations
+#define PIN_MISO 4
+#define PIN_CS   5
+#define PIN_SCK  6
+#define PIN_MOSI 7
+#define SPI_PORT spi0
+
+//GPIO for timing the ISR
+#define ISR_GPIO 2
+
+// DDS sine table
+#define sine_table_size 256
+volatile int sin_table[sine_table_size] ;
+
+volatile static unsigned int adc_val ;
+
+static int map(int x, int in_min, int in_max, int out_min, int out_max) {
+    return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+
+// ==================================================
+// === toggle25 thread 
+// ==================================================
+//  
+static PT_THREAD (protothread_toggle25(struct pt *pt))
+{
+    PT_BEGIN(pt);
+
+      while(1) {
+        // toggle gpio 25
+        gpio_put(LED_PIN, !gpio_get(LED_PIN));
+
+        // Read the ADC
+        adc_val = adc_read() ;
+
+        phase_incr_main = (map(adc_val, 0, 4095, 0, 10000)*two32)/Fs;
+
+        // Print the value
+        printf(&quot;ADC value: %d\n&quot;, adc_val) ;
+
+        // Yield
+        PT_YIELD_usec(10000) ; //yeild every 10 ms
+      } // END WHILE(1)
+      // every thread ends with PT_END(pt);
+      PT_END(pt);
+} // end blink thread
+
+// Alarm ISR
+static void alarm_irq(void) {
+
+    // Assert a GPIO when we enter the interrupt
+    gpio_put(ISR_GPIO, 1) ;
+
+    // Clear the alarm irq
+    hw_clear_bits(&amp;timer_hw-&gt;intr, 1u &lt;&lt; ALARM_NUM);
+
+    // Reset the alarm register
+    timer_hw-&gt;alarm[ALARM_NUM] = timer_hw-&gt;timerawl + DELAY ; 
+
+    // DDS phase and sine table lookup
+    phase_accum_main += phase_incr_main  ;
+    DAC_data = (DAC_config_chan_A | ((sin_table[phase_accum_main&gt;&gt;24] + 2048) &amp; 0xffff))  ;
+
+    // Perform an SPI transaction
+    spi_write16_blocking(SPI_PORT, &amp;DAC_data, 1) ;
+
+    // De-assert the GPIO when we leave the interrupt
+    gpio_put(ISR_GPIO, 0) ;
+
+}
+
+// ========================================
+// === core 0 main
+// ========================================
+int main(){
+  //===  start the serial i/o ==================
+  stdio_init_all() ;
+  // announce the threader version on system reset
+  // if there is a seral terminal attached
+  printf(&quot;\n\rProtothreads RP2040 v1.4\n\r&quot;);
+
+  // Setup the ADC
+  adc_init() ;
+  adc_gpio_init(ADC_PIN) ;
+  adc_select_input(ADC_MUX) ;
+
+  // Initialize stdio
+    stdio_init_all();
+    printf(&quot;Hello, DAC!\n&quot;);
+
+    // Initialize SPI channel (channel, baud rate set to 20MHz)
+    spi_init(SPI_PORT, 20000000) ;
+    // Format (channel, data bits per transfer, polarity, phase, order)
+    spi_set_format(SPI_PORT, 16, 0, 0, 0);
+
+    // Setup the ISR-timing GPIO
+    gpio_init(ISR_GPIO) ;
+    gpio_set_dir(ISR_GPIO, GPIO_OUT);
+    gpio_put(ISR_GPIO, 0) ;
+
+    // Map SPI signals to GPIO ports
+    gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
+    gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
+    gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
+    gpio_set_function(PIN_CS, GPIO_FUNC_SPI) ;
+
+    // === build the sine lookup table =======
+   	// scaled to produce values between 0 and 4096
+    int ii;
+    for (ii = 0; ii &lt; sine_table_size; ii++){
+         sin_table[ii] = (int)(2047*sin((float)ii*6.283/(float)sine_table_size));
+    }
+
+        // Enable the interrupt for the alarm (we&#x27;re using Alarm 0)
+    hw_set_bits(&amp;timer_hw-&gt;inte, 1u &lt;&lt; ALARM_NUM) ;
+    // Associate an interrupt handler with the ALARM_IRQ
+    irq_set_exclusive_handler(ALARM_IRQ, alarm_irq) ;
+    // Enable the alarm interrupt
+    irq_set_enabled(ALARM_IRQ, true) ;
+    // Write the lower 32 bits of the target time to the alarm register, arming it.
+    timer_hw-&gt;alarm[ALARM_NUM] = timer_hw-&gt;timerawl + DELAY ;
+
+  // set up LED gpio 25
+  gpio_init(LED_PIN) ;  
+  gpio_set_dir(LED_PIN, GPIO_OUT) ;
+  gpio_put(LED_PIN, true);
+
+  // === config threads ========================
+  pt_add_thread(protothread_toggle25);
+  
+  // === initalize the scheduler ===============
+  pt_schedule_start ;
+
+    // Nothing happening here
+    while(1){
+    }
+    return 0;
+} // end main</code></pre>
+<h2>ADC_DDS_keypad_mute.c</h2>
+<p>Week 2 mute stage: keypad scanning and a four-state debounce machine set tone_enabled; the amplitude thread ramps output rather than rebuilding the sine table.</p>
+<pre><code>
+/*
+Simple ADC/Protothreads demo
+
+Schedules a single thread, reads/prints ADC value
+
+ */
+
+#include &quot;hardware/gpio.h&quot;
+#include &quot;hardware/timer.h&quot;
+#include &quot;hardware/adc.h&quot;
+#include &quot;pico/stdlib.h&quot;
+#include &quot;pico/multicore.h&quot;
+#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+#include &quot;stdlib.h&quot;
+#include &quot;hardware/spi.h&quot;
+#include &lt;math.h&gt;
+#include &quot;hardware/irq.h&quot;
+#include &quot;hardware/pio.h&quot;
+#include &quot;hardware/dma.h&quot;
+#include &quot;hardware/sync.h&quot;
+#include &quot;hardware/spi.h&quot;
+#include &quot;hardware/clocks.h&quot;
+
+// ==========================================
+// === protothreads globals
+// ==========================================
+// protothreads header
+#include &quot;pt_cornell_rp2040_v1_4.h&quot;
+
+#define LED_PIN 25
+#define ADC_PIN 26
+#define ADC_MUX 0
+
+// Low-level alarm infrastructure we&#x27;ll be using
+#define ALARM_NUM 0
+#define ALARM_IRQ timer_hardware_alarm_get_irq_num(timer_hw, ALARM_NUM)
+
+//DDS parameters
+#define two32 4294967296.0 // 2^32 
+#define Fs 50000
+#define DELAY 20 // 1/Fs (in microseconds)
+
+//keypad constants
+#define BASE_KEYPAD_PIN 9
+#define KEYROWS         4
+#define NUMKEYS         12
+// the DDS units:
+volatile unsigned int phase_accum_main;
+volatile unsigned int phase_incr_main;
+
+// SPI data
+uint16_t DAC_data ; // output value
+
+//DAC parameters
+// A-channel, 1x, active
+#define DAC_config_chan_A 0b0011000000000000
+// B-channel, 1x, active
+#define DAC_config_chan_B 0b1011000000000000
+
+//SPI configurations
+#define PIN_MISO 4
+#define PIN_CS   5
+#define PIN_SCK  6
+#define PIN_MOSI 7
+#define SPI_PORT spi0
+
+//GPIO for timing the ISR
+#define ISR_GPIO 2
+
+// DDS sine table
+#define sine_table_size 256
+volatile int sin_table[sine_table_size] ;
+
+volatile static unsigned int adc_val ;
+
+static int map(int x, int in_min, int in_max, int out_min, int out_max) {
+    return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+
+//keycodes
+unsigned int keycodes[NUMKEYS] = {      0x57, 0x6E, 0x5E, 0x3E, 0x6D,
+                                        0x5D, 0x3D, 0x6B, 0x5B, 0x3B,
+                                        0x67, 0x37} ;
+unsigned int scancodes[KEYROWS] = {   0xE, 0xD, 0xB, 0x7} ;
+unsigned int button = 0x70 ;
+char keytext[40];
+int prev_key = 0;
+
+//muting variables
+#define AMPLITUDE_STEP 103 // 20 updates at 1 ms each for a full fade
+volatile bool tone_enabled = true;
+volatile int amplitude = 2047; // 0 = silent, 2047 = full amplitude
+
+//debouncing states
+#define NOT_PRESSED 0
+#define MAYBE_PRESSED 1
+#define PRESSED 2
+#define MAYBE_NOT_PRESSED 3
+
+
+// ==================================================
+// === toggle25 thread 
+// ==================================================
+//  
+static PT_THREAD (protothread_toggle25(struct pt *pt))
+{
+    PT_BEGIN(pt);
+
+      while(1) {
+        // toggle gpio 25
+        gpio_put(LED_PIN, !gpio_get(LED_PIN));
+
+        // Read the ADC
+        adc_val = adc_read() ;
+
+        phase_incr_main = (map(adc_val, 0, 4095, 0, 10000)*two32)/Fs;
+
+        // Print the value
+        printf(&quot;ADC value: %d\n&quot;, adc_val) ;
+
+        // Yield
+        PT_YIELD_usec(10000) ; //yeild every 10 ms
+      } // END WHILE(1)
+      // every thread ends with PT_END(pt);
+      PT_END(pt);
+} // end blink thread
+
+// This thread runs on core 0
+static PT_THREAD (protothread_core_0(struct pt *pt))
+{
+    // Indicate thread beginning
+    PT_BEGIN(pt) ;
+
+    // Some variables
+    static int i ;
+    static uint32_t keypad ;
+    static int possible;
+    static int state;
+
+    while(1) {
+
+        // Scan the keypad!
+        for (i=0; i&lt;KEYROWS; i++) {
+            // Set a row high
+            gpio_put_masked((0xF &lt;&lt; BASE_KEYPAD_PIN),
+                            (scancodes[i] &lt;&lt; BASE_KEYPAD_PIN)) ;
+            // Small delay required
+            sleep_us(1) ;
+            // Read the keycode
+            keypad = ((gpio_get_all() &gt;&gt; BASE_KEYPAD_PIN) &amp; 0x7F) ;
+            // Break if button(s) are pressed
+            if ((~keypad) &amp; button) break ;
+        }
+        // If we found a button . . .
+        if ((~keypad) &amp; button) {
+            // Look for a valid keycode.
+            for (i=0; i&lt;NUMKEYS; i++) {
+                if (keypad == keycodes[i]) break ;
+            }
+            // If we don&#x27;t find one, report invalid keycode
+            if (i==NUMKEYS) (i = -1) ;
+        }
+        // Otherwise, indicate invalid/non-pressed buttons
+        else (i=-1) ;
+
+        switch (state) {
+
+          case NOT_PRESSED:
+            if (i != -1) {
+              possible = i;
+              state = MAYBE_PRESSED;
+            }
+            break;
+
+          case MAYBE_PRESSED:
+            if (i == possible){
+              state = PRESSED;
+              // Toggle once on confirmed release of the remembered key.
+              if (possible == 0) {
+                tone_enabled = !tone_enabled;
+              // Print key to terminal
+              printf(&quot;\n%d&quot;, i) ;
+              }
+            }
+            else {
+              state = NOT_PRESSED;
+            }
+            break;
+          
+          case PRESSED:
+            if (i == possible){
+              state = PRESSED;
+            }
+            else {
+              state = MAYBE_NOT_PRESSED;
+            }
+            break;
+
+          case MAYBE_NOT_PRESSED:
+            if (i == possible){
+              state = PRESSED;
+            }
+            else {
+              state = NOT_PRESSED;
+              }
+            break;
+
+          default:
+            state = NOT_PRESSED;
+            break;
+
+        }
+
+        PT_YIELD_usec(30000) ;
+    }
+    // Indicate thread end
+    PT_END(pt) ;
+}
+
+// This thread runs on core 0
+static PT_THREAD (protothread_amplitude(struct pt *pt))
+{
+    // Indicate thread beginning
+    PT_BEGIN(pt) ;
+
+    while (1){
+
+      if (tone_enabled &amp;&amp; amplitude &lt; 2047){
+        int next_amplitude = amplitude + AMPLITUDE_STEP;
+        amplitude = (next_amplitude &gt; 2047) ? 2047 : next_amplitude;
+      }
+
+      else if (!tone_enabled &amp;&amp; amplitude &gt; 0){
+        int next_amplitude = amplitude - AMPLITUDE_STEP;
+        amplitude = (next_amplitude &lt; 0) ? 0 : next_amplitude;
+      }
+
+      PT_YIELD_usec(1000) ;
+    }
+
+    PT_END(pt) ;
+
+}
+
+// Alarm ISR
+static void alarm_irq(void) {
+
+    // Assert a GPIO when we enter the interrupt
+    gpio_put(ISR_GPIO, 1) ;
+
+    // Clear the alarm irq
+    hw_clear_bits(&amp;timer_hw-&gt;intr, 1u &lt;&lt; ALARM_NUM);
+
+    // Reset the alarm register
+    timer_hw-&gt;alarm[ALARM_NUM] = timer_hw-&gt;timerawl + DELAY ; 
+
+    // DDS phase and sine table lookup
+    phase_accum_main += phase_incr_main  ;
+    DAC_data = (DAC_config_chan_A | (((sin_table[phase_accum_main&gt;&gt;24] * amplitude)/2047 + 2048) &amp; 0xffff))  ;
+
+    // Perform an SPI transaction
+    spi_write16_blocking(SPI_PORT, &amp;DAC_data, 1) ;
+
+    // De-assert the GPIO when we leave the interrupt
+    gpio_put(ISR_GPIO, 0) ;
+
+}
+
+// ========================================
+// === core 0 main
+// ========================================
+int main(){
+  //===  start the serial i/o ==================
+  stdio_init_all() ;
+  // announce the threader version on system reset
+  // if there is a seral terminal attached
+  printf(&quot;\n\rProtothreads RP2040 v1.4\n\r&quot;);
+
+  // Setup the ADC
+  adc_init() ;
+  adc_gpio_init(ADC_PIN) ;
+  adc_select_input(ADC_MUX) ;
+
+  // Initialize stdio
+  stdio_init_all();
+  printf(&quot;Hello, DAC!\n&quot;);
+
+  // Initialize SPI channel (channel, baud rate set to 20MHz)
+  spi_init(SPI_PORT, 20000000) ;
+  // Format (channel, data bits per transfer, polarity, phase, order)
+  spi_set_format(SPI_PORT, 16, 0, 0, 0);
+
+  // Setup the ISR-timing GPIO
+  gpio_init(ISR_GPIO) ;
+  gpio_set_dir(ISR_GPIO, GPIO_OUT);
+  gpio_put(ISR_GPIO, 0) ;
+
+  // Map SPI signals to GPIO ports
+  gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
+  gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
+  gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
+  gpio_set_function(PIN_CS, GPIO_FUNC_SPI) ;
+
+  // === build the sine lookup table =======
+  // scaled to produce values between 0 and 4096
+  int ii;
+  for (ii = 0; ii &lt; sine_table_size; ii++){
+        sin_table[ii] = (int)(2047*sin((float)ii*6.283/(float)sine_table_size));
+  }
+
+      // Enable the interrupt for the alarm (we&#x27;re using Alarm 0)
+  hw_set_bits(&amp;timer_hw-&gt;inte, 1u &lt;&lt; ALARM_NUM) ;
+  // Associate an interrupt handler with the ALARM_IRQ
+  irq_set_exclusive_handler(ALARM_IRQ, alarm_irq) ;
+  // Enable the alarm interrupt
+  irq_set_enabled(ALARM_IRQ, true) ;
+  // Write the lower 32 bits of the target time to the alarm register, arming it.
+  timer_hw-&gt;alarm[ALARM_NUM] = timer_hw-&gt;timerawl + DELAY ;
+
+  // set up LED gpio 25
+  gpio_init(LED_PIN) ;  
+  gpio_set_dir(LED_PIN, GPIO_OUT) ;
+  gpio_put(LED_PIN, true);
+
+    ////////////////// KEYPAD INITS ///////////////////////
+  // Initialize the keypad GPIO&#x27;s
+  gpio_init_mask((0x7F &lt;&lt; BASE_KEYPAD_PIN)) ;
+  gpio_set_dir((BASE_KEYPAD_PIN+4), GPIO_IN);
+  gpio_set_dir((BASE_KEYPAD_PIN+5), GPIO_IN);
+  gpio_set_dir((BASE_KEYPAD_PIN+6), GPIO_IN);
+  // Set row-pins to output
+  gpio_set_dir_out_masked((0xF &lt;&lt; BASE_KEYPAD_PIN)) ;
+  // Set all output pins to low
+  gpio_put_masked((0xF &lt;&lt; BASE_KEYPAD_PIN), (0xF &lt;&lt; BASE_KEYPAD_PIN)) ;
+  // Turn on pulldown resistors for column pins (on by default)
+  gpio_pull_up((BASE_KEYPAD_PIN+4)) ;
+  gpio_pull_up((BASE_KEYPAD_PIN+5)) ;
+  gpio_pull_up((BASE_KEYPAD_PIN+6)) ;
+
+  // === config threads ========================
+  pt_add_thread(protothread_toggle25);
+  pt_add_thread(protothread_core_0);
+  pt_add_thread(protothread_amplitude);
+  
+  // === initalize the scheduler ===============
+  pt_schedule_start ;
+
+  // Nothing happening here
+  while(1){
+  }
+  return 0;
+} // end main</code></pre>
+<h2>ADC_DDS_keypad_record.c</h2>
+<p>Week 2 recording stage: nine buffers store frequencies in Hz. The recording and playback threads both request 10 ms intervals. Historical snapshot, not the current build target.</p>
+<pre><code>
+/*
+Simple ADC/Protothreads demo
+
+Schedules a single thread, reads/prints ADC value
+
+ */
+
+#include &quot;hardware/gpio.h&quot;
+#include &quot;hardware/timer.h&quot;
+#include &quot;hardware/adc.h&quot;
+#include &quot;pico/stdlib.h&quot;
+#include &quot;pico/multicore.h&quot;
+#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+#include &quot;stdlib.h&quot;
+#include &quot;hardware/spi.h&quot;
+#include &lt;math.h&gt;
+#include &quot;hardware/irq.h&quot;
+#include &quot;hardware/pio.h&quot;
+#include &quot;hardware/dma.h&quot;
+#include &quot;hardware/sync.h&quot;
+#include &quot;hardware/spi.h&quot;
+#include &quot;hardware/clocks.h&quot;
+
+// ==========================================
+// === protothreads globals
+// ==========================================
+// protothreads header
+#include &quot;pt_cornell_rp2040_v1_4.h&quot;
+
+#define LED_PIN 25
+#define ADC_PIN 26
+#define ADC_MUX 0
+
+// Low-level alarm infrastructure we&#x27;ll be using
+#define ALARM_NUM 0
+#define ALARM_IRQ timer_hardware_alarm_get_irq_num(timer_hw, ALARM_NUM)
+
+//DDS parameters
+#define two32 4294967296.0 // 2^32 
+#define Fs 50000
+#define DELAY 20 // 1/Fs (in microseconds)
+
+//keypad constants
+#define BASE_KEYPAD_PIN 9
+#define KEYROWS         4
+#define NUMKEYS         12
+// the DDS units:
+volatile unsigned int phase_accum_main;
+volatile unsigned int phase_incr_main;
+
+// SPI data
+uint16_t DAC_data ; // output value
+
+//DAC parameters
+// A-channel, 1x, active
+#define DAC_config_chan_A 0b0011000000000000
+// B-channel, 1x, active
+#define DAC_config_chan_B 0b1011000000000000
+
+//SPI configurations
+#define PIN_MISO 4
+#define PIN_CS   5
+#define PIN_SCK  6
+#define PIN_MOSI 7
+#define SPI_PORT spi0
+
+//GPIO for timing the ISR
+#define ISR_GPIO 2
+
+// DDS sine table
+#define sine_table_size 256
+volatile int sin_table[sine_table_size] ;
+
+volatile static unsigned int adc_val ;
+
+static int map(int x, int in_min, int in_max, int out_min, int out_max) {
+    return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+
+//keycodes
+unsigned int keycodes[NUMKEYS] = {      0x57, 0x6E, 0x5E, 0x3E, 0x6D,
+                                        0x5D, 0x3D, 0x6B, 0x5B, 0x3B,
+                                        0x67, 0x37} ;
+unsigned int scancodes[KEYROWS] = {   0xE, 0xD, 0xB, 0x7} ;
+unsigned int button = 0x70 ;
+char keytext[40];
+int prev_key = 0;
+
+//muting variables
+#define AMPLITUDE_STEP 103 // 20 updates at 1 ms each for a full fade
+volatile bool tone_enabled = false;
+volatile int amplitude = 0; // 0 = silent, 2047 = full amplitude
+
+//record variables
+
+#define RECORD_HZ 100
+#define MAX_SAMPLES (10 * RECORD_HZ)
+
+volatile bool record_mode = false;
+volatile bool record = false;
+volatile bool play = false;
+volatile int record_button = -1;
+volatile int play_button = -1;
+volatile int play_index = 0;
+volatile uint16_t sounds[9][MAX_SAMPLES];
+static unsigned int sound_length[9] = {0};
+
+//debouncing states
+#define NOT_PRESSED 0
+#define MAYBE_PRESSED 1
+#define PRESSED 2
+#define MAYBE_NOT_PRESSED 3
+
+
+// ==================================================
+// === toggle25 thread 
+// ==================================================
+//  
+static PT_THREAD (protothread_toggle25(struct pt *pt))
+{
+    PT_BEGIN(pt);
+
+      while(1) {
+        // toggle gpio 25
+        gpio_put(LED_PIN, !gpio_get(LED_PIN));
+
+        // Read the ADC
+        adc_val = adc_read() ;
+
+        if (!play){
+          phase_incr_main = (map(adc_val, 0, 4095, 0, 10000)*two32)/Fs;
+        }
+        
+
+        // Print the value
+        //printf(&quot;ADC value: %d\n&quot;, adc_val) ;
+
+        // Yield
+        PT_YIELD_usec(10000) ; //yeild every 10 ms
+      } // END WHILE(1)
+      // every thread ends with PT_END(pt);
+      PT_END(pt);
+} // end blink thread
+
+// This thread runs on core 0
+static PT_THREAD (protothread_core_0(struct pt *pt))
+{
+    // Indicate thread beginning
+    PT_BEGIN(pt) ;
+
+    // Some variables
+    static int i ;
+    static uint32_t keypad ;
+    static int possible;
+    static int state;
+
+    while(1) {
+
+        // Scan the keypad!
+        for (i=0; i&lt;KEYROWS; i++) {
+            // Set a row high
+            gpio_put_masked((0xF &lt;&lt; BASE_KEYPAD_PIN),
+                            (scancodes[i] &lt;&lt; BASE_KEYPAD_PIN)) ;
+            // Small delay required
+            sleep_us(1) ;
+            // Read the keycode
+            keypad = ((gpio_get_all() &gt;&gt; BASE_KEYPAD_PIN) &amp; 0x7F) ;
+            // Break if button(s) are pressed
+            if ((~keypad) &amp; button) break ;
+        }
+        // If we found a button . . .
+        if ((~keypad) &amp; button) {
+            // Look for a valid keycode.
+            for (i=0; i&lt;NUMKEYS; i++) {
+                if (keypad == keycodes[i]) break ;
+            }
+            // If we don&#x27;t find one, report invalid keycode
+            if (i==NUMKEYS) (i = -1) ;
+        }
+        // Otherwise, indicate invalid/non-pressed buttons
+        else (i=-1) ;
+
+        switch (state) {
+
+          case NOT_PRESSED:
+            if (i != -1) {
+              possible = i;
+              state = MAYBE_PRESSED;
+            }
+            break;
+
+          case MAYBE_PRESSED:
+            if (i == possible){
+              state = PRESSED;
+              // Toggle once on confirmed release of the remembered key.
+              if (possible == 0) {
+                tone_enabled = !tone_enabled;
+              ;
+              }
+
+              if (possible == 10){
+                record_mode = true;
+                play = false;
+              }
+
+              if (!record_mode &amp;&amp; (possible &lt;=9 &amp;&amp; possible &gt;= 1)){
+                play = true;
+                play_button = possible;
+                play_index = 0;
+                tone_enabled = true;
+              }
+              // Print key to terminal
+              printf(&quot;\n%d&quot;, i); 
+            }
+            else {
+              state = NOT_PRESSED;
+            }
+            break;
+          
+          case PRESSED:
+            if (i == possible){
+              state = PRESSED;
+              if (record_mode &amp;&amp; (possible &lt;=9 &amp;&amp; possible &gt;= 1)){
+                record_button = possible;
+                record = true;
+              }
+            }
+            else {
+              state = MAYBE_NOT_PRESSED;
+            }
+            break;
+
+          case MAYBE_NOT_PRESSED:
+            if (i == possible){
+              state = PRESSED;
+            }
+            else {
+              state = NOT_PRESSED;
+              if (record_mode &amp;&amp; possible == record_button){
+                record_mode = false;
+                record = false;
+                record_button = -1;
+              }
+              }
+            break;
+
+          default:
+            state = NOT_PRESSED;
+            break;
+
+        }
+
+        PT_YIELD_usec(30000) ;
+    }
+    // Indicate thread end
+    PT_END(pt) ;
+}
+
+// This thread ramps up/down amplitude of output wave
+static PT_THREAD (protothread_amplitude(struct pt *pt))
+{
+    // Indicate thread beginning
+    PT_BEGIN(pt) ;
+
+    while (1){
+
+      if (tone_enabled &amp;&amp; amplitude &lt; 2047){
+        int next_amplitude = amplitude + AMPLITUDE_STEP;
+        amplitude = (next_amplitude &gt; 2047) ? 2047 : next_amplitude;
+      }
+
+      else if (!tone_enabled &amp;&amp; amplitude &gt; 0){
+        int next_amplitude = amplitude - AMPLITUDE_STEP;
+        amplitude = (next_amplitude &lt; 0) ? 0 : next_amplitude;
+      }
+
+      PT_YIELD_usec(1000) ;
+    }
+
+    PT_END(pt) ;
+
+}
+
+// This thread handkes playback
+static PT_THREAD (protothread_playback(struct pt *pt))
+{
+    // Indicate thread beginning
+    PT_BEGIN(pt) ;
+
+    while (1){
+
+      if (play){
+        if (play_index &lt; sound_length[play_button - 1]) {
+          uint16_t frequency = sounds[play_button - 1][play_index++];
+
+          phase_incr_main = (unsigned int)((frequency * two32) / Fs);
+        }
+        else {
+          play_index = 0;
+          play = false;
+          tone_enabled = false;
+        }
+      }
+      else{
+        play_index = 0;
+      }
+
+      PT_YIELD_usec(10000) ;
+    }
+
+    PT_END(pt) ;
+
+}
+
+static PT_THREAD (protothread_recording(struct pt *pt))
+{
+    // Indicate thread beginning
+    PT_BEGIN(pt) ;
+
+    static int length = 0;
+
+    while (1){
+
+      if (record){
+
+        if(record_button != -1 &amp;&amp; length &lt; MAX_SAMPLES){
+          sounds[record_button - 1][length] = (uint16_t)map(adc_val, 0, 4095, 0, 10000);;
+          length++;
+          sound_length[record_button - 1] = length;
+        }
+      }
+      else{
+        length = 0;
+      }
+
+
+      PT_YIELD_usec(10000) ;
+    }
+
+    PT_END(pt) ;
+
+}
+
+// Alarm ISR
+static void alarm_irq(void) {
+
+    // Assert a GPIO when we enter the interrupt
+    gpio_put(ISR_GPIO, 1) ;
+
+    // Clear the alarm irq
+    hw_clear_bits(&amp;timer_hw-&gt;intr, 1u &lt;&lt; ALARM_NUM);
+
+    // Reset the alarm register
+    timer_hw-&gt;alarm[ALARM_NUM] = timer_hw-&gt;timerawl + DELAY ; 
+
+    // DDS phase and sine table lookup
+    phase_accum_main += phase_incr_main  ;
+
+    DAC_data = (DAC_config_chan_A | (((sin_table[phase_accum_main&gt;&gt;24] * amplitude)/2047 + 2048) &amp; 0xffff))  ;
+
+    // Perform an SPI transaction
+    spi_write16_blocking(SPI_PORT, &amp;DAC_data, 1) ;
+
+    // De-assert the GPIO when we leave the interrupt
+    gpio_put(ISR_GPIO, 0) ;
+
+}
+
+// ========================================
+// === core 0 main
+// ========================================
+int main(){
+  //===  start the serial i/o ==================
+  stdio_init_all() ;
+  // announce the threader version on system reset
+  // if there is a seral terminal attached
+  printf(&quot;\n\rProtothreads RP2040 v1.4\n\r&quot;);
+
+  // Setup the ADC
+  adc_init() ;
+  adc_gpio_init(ADC_PIN) ;
+  adc_select_input(ADC_MUX) ;
+
+  // Initialize stdio
+  stdio_init_all();
+  printf(&quot;Hello, DAC!\n&quot;);
+
+  // Initialize SPI channel (channel, baud rate set to 20MHz)
+  spi_init(SPI_PORT, 20000000) ;
+  // Format (channel, data bits per transfer, polarity, phase, order)
+  spi_set_format(SPI_PORT, 16, 0, 0, 0);
+
+  // Setup the ISR-timing GPIO
+  gpio_init(ISR_GPIO) ;
+  gpio_set_dir(ISR_GPIO, GPIO_OUT);
+  gpio_put(ISR_GPIO, 0) ;
+
+  // Map SPI signals to GPIO ports
+  gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
+  gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
+  gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
+  gpio_set_function(PIN_CS, GPIO_FUNC_SPI) ;
+
+  // === build the sine lookup table =======
+  // scaled to produce values between 0 and 4096
+  int ii;
+  for (ii = 0; ii &lt; sine_table_size; ii++){
+        sin_table[ii] = (int)(2047*sin((float)ii*6.283/(float)sine_table_size));
+  }
+
+      // Enable the interrupt for the alarm (we&#x27;re using Alarm 0)
+  hw_set_bits(&amp;timer_hw-&gt;inte, 1u &lt;&lt; ALARM_NUM) ;
+  // Associate an interrupt handler with the ALARM_IRQ
+  irq_set_exclusive_handler(ALARM_IRQ, alarm_irq) ;
+  // Enable the alarm interrupt
+  irq_set_enabled(ALARM_IRQ, true) ;
+  // Write the lower 32 bits of the target time to the alarm register, arming it.
+  timer_hw-&gt;alarm[ALARM_NUM] = timer_hw-&gt;timerawl + DELAY ;
+
+  // set up LED gpio 25
+  gpio_init(LED_PIN) ;  
+  gpio_set_dir(LED_PIN, GPIO_OUT) ;
+  gpio_put(LED_PIN, true);
+
+    ////////////////// KEYPAD INITS ///////////////////////
+  // Initialize the keypad GPIO&#x27;s
+  gpio_init_mask((0x7F &lt;&lt; BASE_KEYPAD_PIN)) ;
+  gpio_set_dir((BASE_KEYPAD_PIN+4), GPIO_IN);
+  gpio_set_dir((BASE_KEYPAD_PIN+5), GPIO_IN);
+  gpio_set_dir((BASE_KEYPAD_PIN+6), GPIO_IN);
+  // Set row-pins to output
+  gpio_set_dir_out_masked((0xF &lt;&lt; BASE_KEYPAD_PIN)) ;
+  // Set all output pins to low
+  gpio_put_masked((0xF &lt;&lt; BASE_KEYPAD_PIN), (0xF &lt;&lt; BASE_KEYPAD_PIN)) ;
+  // Turn on pulldown resistors for column pins (on by default)
+  gpio_pull_up((BASE_KEYPAD_PIN+4)) ;
+  gpio_pull_up((BASE_KEYPAD_PIN+5)) ;
+  gpio_pull_up((BASE_KEYPAD_PIN+6)) ;
+
+  // === config threads ========================
+  pt_add_thread(protothread_toggle25);
+  pt_add_thread(protothread_core_0);
+  pt_add_thread(protothread_amplitude);
+  pt_add_thread(protothread_playback);
+  pt_add_thread(protothread_recording);
+  
+  // === initalize the scheduler ===============
+  pt_schedule_start ;
+
+  // Nothing happening here
+  while(1){
+  }
+  return 0;
+} // end main</code></pre>
+<h2>ADC_DDS_keypad_speedup.c</h2>
+<p>Final target: frequency recording at 10 ms, playback at 1 ms, soundboard previews during compose entry, and indirect sequence playback. Read the known limitations in the main report.</p>
+<pre><code>
+/*
+Simple ADC/Protothreads demo
+
+Schedules a single thread, reads/prints ADC value
+
+ */
+
+#include &quot;hardware/gpio.h&quot;
+#include &quot;hardware/timer.h&quot;
+#include &quot;hardware/adc.h&quot;
+#include &quot;pico/stdlib.h&quot;
+#include &quot;pico/multicore.h&quot;
+#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+#include &quot;stdlib.h&quot;
+#include &quot;hardware/spi.h&quot;
+#include &lt;math.h&gt;
+#include &quot;hardware/irq.h&quot;
+#include &quot;hardware/pio.h&quot;
+#include &quot;hardware/dma.h&quot;
+#include &quot;hardware/sync.h&quot;
+#include &quot;hardware/spi.h&quot;
+#include &quot;hardware/clocks.h&quot;
+
+// ==========================================
+// === protothreads globals
+// ==========================================
+// protothreads header
+#include &quot;pt_cornell_rp2040_v1_4.h&quot;
+
+#define LED_PIN 25
+#define ADC_PIN 26
+#define ADC_MUX 0
+
+// Low-level alarm infrastructure we&#x27;ll be using
+#define ALARM_NUM 0
+#define ALARM_IRQ timer_hardware_alarm_get_irq_num(timer_hw, ALARM_NUM)
+
+//DDS parameters
+#define two32 4294967296.0 // 2^32 
+#define Fs 50000
+#define DELAY 20 // 1/Fs (in microseconds)
+
+//keypad constants
+#define BASE_KEYPAD_PIN 9
+#define KEYROWS         4
+#define NUMKEYS         12
+// the DDS units:
+volatile unsigned int phase_accum_main;
+volatile unsigned int phase_incr_main;
+
+// SPI data
+uint16_t DAC_data ; // output value
+
+//DAC parameters
+// A-channel, 1x, active
+#define DAC_config_chan_A 0b0011000000000000
+// B-channel, 1x, active
+#define DAC_config_chan_B 0b1011000000000000
+
+//SPI configurations
+#define PIN_MISO 4
+#define PIN_CS   5
+#define PIN_SCK  6
+#define PIN_MOSI 7
+#define SPI_PORT spi0
+
+//GPIO for timing the ISR
+#define ISR_GPIO 2
+
+// DDS sine table
+#define sine_table_size 256
+volatile int sin_table[sine_table_size] ;
+
+volatile static unsigned int adc_val ;
+
+static int map(int x, int in_min, int in_max, int out_min, int out_max) {
+    return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+
+//keycodes
+unsigned int keycodes[NUMKEYS] = {      0x57, 0x6E, 0x5E, 0x3E, 0x6D,
+                                        0x5D, 0x3D, 0x6B, 0x5B, 0x3B,
+                                        0x67, 0x37} ;
+unsigned int scancodes[KEYROWS] = {   0xE, 0xD, 0xB, 0x7} ;
+unsigned int button = 0x70 ;
+char keytext[40];
+int prev_key = 0;
+
+// REPORT NOTE: amplitude scales the signed sample; midpoint is added afterward.
+// In the final file, startup sound is enabled and the ramp yield is 50 us.
+//muting variables
+#define AMPLITUDE_STEP 103 // 20 updates at 1 ms each for a full fade
+volatile bool tone_enabled = true;
+volatile int amplitude = 2047; // 0 = silent, 2047 = full amplitude
+
+// REPORT NOTE: frequency storage is RAM-only. Key k uses row k-1.
+// Valid lengths bound replay; capacity is 1000 samples per sound.
+//record variables
+
+#define RECORD_HZ 100
+#define MAX_SAMPLES (10 * RECORD_HZ)
+
+volatile bool record_mode = false;
+volatile bool record = false;
+volatile bool play = false;
+volatile int record_button = -1;
+volatile int play_button = -1;
+volatile int play_index = 0;
+volatile uint16_t sounds[9][MAX_SAMPLES];
+static unsigned int sound_length[9] = {0};
+
+// REPORT NOTE: the sequence stores key IDs, not waveform data or delays.
+// current_button indexes the sequence; its value selects a sound slot.
+//compose variables
+volatile bool compose_mode = false;
+volatile bool play_compose = false;
+volatile int current_button = 0;
+volatile int compose_sequence[9];
+volatile int compose_length;
+
+//debouncing states
+#define NOT_PRESSED 0
+#define MAYBE_PRESSED 1
+#define PRESSED 2
+#define MAYBE_NOT_PRESSED 3
+
+
+// ==================================================
+// === toggle25 thread 
+// ==================================================
+//  
+// REPORT NOTE: live ADC updates must not replace a playback frequency.
+// Diagnostic printing and cooperative scheduling affect update timing.
+static PT_THREAD (protothread_toggle25(struct pt *pt))
+{
+    PT_BEGIN(pt);
+
+      while(1) {
+        // toggle gpio 25
+        gpio_put(LED_PIN, !gpio_get(LED_PIN));
+
+        // Read the ADC
+        adc_val = adc_read() ;
+
+        printf(&quot;FREQUENCY: \n%d&quot;, map(adc_val, 0, 4095, 0, 10000));
+
+        if (!play &amp;&amp; !play_compose){
+          phase_incr_main = (map(adc_val, 0, 4095, 0, 10000)*two32)/Fs;
+        }
+        
+
+        // Print the value
+        //printf(&quot;ADC value: %d\n&quot;, adc_val) ;
+
+        // Yield
+        PT_YIELD_usec(10000) ; //yeild every 10 ms
+      } // END WHILE(1)
+      // every thread ends with PT_END(pt);
+      PT_END(pt);
+} // end blink thread
+
+// This thread runs on core 0
+// REPORT NOTE: scan and debounce once per 30 ms yield cycle.
+// This snapshot dispatches controls on confirmed PRESS, not release.
+static PT_THREAD (protothread_core_0(struct pt *pt))
+{
+    // Indicate thread beginning
+    PT_BEGIN(pt) ;
+
+    // Some variables
+    static int i ;
+    static uint32_t keypad ;
+    static int possible;
+    static int state;
+
+    while(1) {
+
+        // Scan the keypad!
+        for (i=0; i&lt;KEYROWS; i++) {
+            // Set a row high
+            gpio_put_masked((0xF &lt;&lt; BASE_KEYPAD_PIN),
+                            (scancodes[i] &lt;&lt; BASE_KEYPAD_PIN)) ;
+            // Small delay required
+            sleep_us(1) ;
+            // Read the keycode
+            keypad = ((gpio_get_all() &gt;&gt; BASE_KEYPAD_PIN) &amp; 0x7F) ;
+            // Break if button(s) are pressed
+            if ((~keypad) &amp; button) break ;
+        }
+        // If we found a button . . .
+        if ((~keypad) &amp; button) {
+            // Look for a valid keycode.
+            for (i=0; i&lt;NUMKEYS; i++) {
+                if (keypad == keycodes[i]) break ;
+            }
+            // If we don&#x27;t find one, report invalid keycode
+            if (i==NUMKEYS) (i = -1) ;
+        }
+        // Otherwise, indicate invalid/non-pressed buttons
+        else (i=-1) ;
+
+        switch (state) {
+
+          case NOT_PRESSED:
+            if (i != -1) {
+              possible = i;
+              state = MAYBE_PRESSED;
+            }
+            break;
+
+// REPORT NOTE: only this transition dispatches new press actions.
+          case MAYBE_PRESSED:
+            if (i == possible){
+              state = PRESSED;
+              // Toggle once on confirmed release of the remembered key.
+              if (possible == 0) {
+                bool other_mode =
+                  record_mode || record || compose_mode || play || play_compose;
+
+                record_mode = false;
+                record = false;
+                record_button = -1;
+
+                compose_mode = false;
+                play_compose = false;
+                current_button = 0;
+
+                play = false;
+                play_button = -1;
+                play_index = 0;
+
+                // Immediately restore the potentiometer frequency.
+                phase_incr_main =
+                    (unsigned int)((map(adc_val, 0, 4095, 0, 10000) * two32) / Fs);
+
+                tone_enabled = other_mode ? true : !tone_enabled;
+              
+              }
+
+              if (possible == 10){
+                record_mode = true;
+                record = false;
+                record_button = -1;
+                play = false;
+                compose_mode = false;
+                play_compose = false;
+                play_index = 0;
+                current_button = 0;
+                tone_enabled = true;
+              }
+
+              if (possible == 11){
+                if (compose_mode) {
+                  compose_mode = false;
+                  // start playing
+                  play = false;
+                  current_button = 0;
+                  play_index = 0;
+                  play_compose = (compose_length &gt; 0);
+                  tone_enabled = play_compose;
+                }
+                else {
+                  compose_mode = true;
+                  record_mode = false;
+                  record = false;
+                  record_button = -1;
+                  compose_length = 0;
+                  play = false;
+                  play_compose = false;
+                  play_index = 0;
+                  current_button = 0;
+                  tone_enabled = false;
+                }
+              }
+
+              if (compose_mode &amp;&amp; (possible &lt;=9 &amp;&amp; possible &gt;= 1) &amp;&amp; compose_length &lt; 9){
+                compose_sequence[compose_length] = possible;
+                compose_length++;
+              }
+
+              if (!record_mode &amp;&amp; (possible &lt;=9 &amp;&amp; possible &gt;= 1 &amp;&amp; sound_length[possible - 1] &gt; 0)){
+                play = true;
+                play_button = possible;
+                play_index = 0;
+                tone_enabled = true;
+                play_compose = false;
+                current_button = 0;
+              }
+
+              // Print key to terminal
+              printf(&quot;\n%d&quot;, i); 
+            }
+            else {
+              state = NOT_PRESSED;
+            }
+            break;
+          
+// REPORT NOTE: the held state starts recording in an armed mode.
+// It is revisited while held, so do not reset the write index here every scan.
+          case PRESSED:
+            if (i == possible){
+              state = PRESSED;
+              if (record_mode &amp;&amp; (possible &lt;=9 &amp;&amp; possible &gt;= 1)){
+                record_button = possible;
+                record = true;
+              }
+            }
+            else {
+              state = MAYBE_NOT_PRESSED;
+            }
+            break;
+
+// REPORT NOTE: two observations of loss of the remembered key end a hold.
+          case MAYBE_NOT_PRESSED:
+            if (i == possible){
+              state = PRESSED;
+            }
+            else {
+              state = NOT_PRESSED;
+              if (record_mode &amp;&amp; possible == record_button){
+                record_mode = false;
+                record = false;
+                record_button = -1;
+              }
+              }
+            break;
+
+          default:
+            state = NOT_PRESSED;
+            break;
+
+        }
+
+        PT_YIELD_usec(30000) ;
+    }
+    // Indicate thread end
+    PT_END(pt) ;
+}
+
+// This thread ramps up/down amplitude of output wave
+// REPORT NOTE: clamp before publishing amplitude so ISR samples remain in range.
+static PT_THREAD (protothread_amplitude(struct pt *pt))
+{
+    // Indicate thread beginning
+    PT_BEGIN(pt) ;
+
+    while (1){
+
+      if (tone_enabled &amp;&amp; amplitude &lt; 2047){
+        int next_amplitude = amplitude + AMPLITUDE_STEP;
+        amplitude = (next_amplitude &gt; 2047) ? 2047 : next_amplitude;
+      }
+
+      else if (!tone_enabled &amp;&amp; amplitude &gt; 0){
+        int next_amplitude = amplitude - AMPLITUDE_STEP;
+        amplitude = (next_amplitude &lt; 0) ? 0 : next_amplitude;
+      }
+
+      PT_YIELD_usec(50) ;
+    }
+
+    PT_END(pt) ;
+
+}
+
+// This thread handkes playback
+// REPORT NOTE: a frequency entry changes DDS increment, not the DAC sample directly.
+// Final composition advances entries in a separate iteration, adding a short dwell.
+static PT_THREAD (protothread_playback(struct pt *pt))
+{
+    // Indicate thread beginning
+    PT_BEGIN(pt) ;
+
+    while (1){
+
+      if (play){
+        if (play_index &lt; sound_length[play_button - 1]) {
+          uint16_t frequency = sounds[play_button - 1][play_index++];
+
+          phase_incr_main = (unsigned int)((frequency * two32) / Fs);
+        }
+        else {
+          play_index = 0;
+          play = false;
+          tone_enabled = false;
+        }
+      }
+      else if (play_compose) {
+        if (current_button &lt; compose_length) {
+          int slot = compose_sequence[current_button] - 1;
+
+          if (play_index &lt; sound_length[slot]) {
+              uint16_t frequency = sounds[slot][play_index++];
+              phase_incr_main =
+                  (unsigned int)((frequency * two32) / Fs);
+          } else {
+              current_button++;
+              play_index = 0;
+          }
+        } 
+        else {
+            play_compose = false;
+            current_button = 0;
+            play_index = 0;
+            tone_enabled = false;
+        }
+      }
+      else{
+        play_index = 0;
+      }
+
+      PT_YIELD_usec(1000) ;
+    }
+
+    PT_END(pt) ;
+
+}
+
+// REPORT NOTE: store mapped Hz, not the much larger 32-bit DDS increment.
+// The idle branch resets the write index; the source does not clear a slot at start.
+static PT_THREAD (protothread_recording(struct pt *pt))
+{
+    // Indicate thread beginning
+    PT_BEGIN(pt) ;
+
+    static int length = 0;
+
+    while (1){
+
+      if (record){
+
+        if(record_button != -1 &amp;&amp; length &lt; MAX_SAMPLES){
+          sounds[record_button - 1][length] = (uint16_t)map(adc_val, 0, 4095, 0, 10000);;
+          length++;
+          sound_length[record_button - 1] = length;
+        }
+      }
+      else{
+        length = 0;
+      }
+
+
+      PT_YIELD_usec(10000) ;
+    }
+
+    PT_END(pt) ;
+
+}
+
+// Alarm ISR
+// REPORT NOTE: GPIO2 high/low brackets the instrumented synthesis body.
+// Rearming relative to the current timer introduces latency into the actual period.
+static void alarm_irq(void) {
+
+    // Assert a GPIO when we enter the interrupt
+    gpio_put(ISR_GPIO, 1) ;
+
+    // Clear the alarm irq
+    hw_clear_bits(&amp;timer_hw-&gt;intr, 1u &lt;&lt; ALARM_NUM);
+
+    // Reset the alarm register
+    timer_hw-&gt;alarm[ALARM_NUM] = timer_hw-&gt;timerawl + DELAY ; 
+
+    // DDS phase and sine table lookup
+    phase_accum_main += phase_incr_main  ;
+
+// REPORT NOTE: sine sample is centered around zero before the +2048 offset.
+// The existing 0xffff mask is retained; valid bounds keep data in 12 bits.
+    DAC_data = (DAC_config_chan_A | (((sin_table[phase_accum_main&gt;&gt;24] * amplitude)/2047 + 2048) &amp; 0xffff))  ;
+
+    // Perform an SPI transaction
+    spi_write16_blocking(SPI_PORT, &amp;DAC_data, 1) ;
+
+    // De-assert the GPIO when we leave the interrupt
+    gpio_put(ISR_GPIO, 0) ;
+
+}
+
+// ========================================
+// === core 0 main
+// ========================================
+// REPORT NOTE: initialize peripherals and sine table before scheduling control work.
+int main(){
+  //===  start the serial i/o ==================
+  stdio_init_all() ;
+  // announce the threader version on system reset
+  // if there is a seral terminal attached
+  printf(&quot;\n\rProtothreads RP2040 v1.4\n\r&quot;);
+
+  // Setup the ADC
+  adc_init() ;
+  adc_gpio_init(ADC_PIN) ;
+  adc_select_input(ADC_MUX) ;
+
+  // Initialize stdio
+  stdio_init_all();
+  printf(&quot;Hello, DAC!\n&quot;);
+
+  // Initialize SPI channel (channel, baud rate set to 20MHz)
+  spi_init(SPI_PORT, 20000000) ;
+  // Format (channel, data bits per transfer, polarity, phase, order)
+  spi_set_format(SPI_PORT, 16, 0, 0, 0);
+
+  // Setup the ISR-timing GPIO
+  gpio_init(ISR_GPIO) ;
+  gpio_set_dir(ISR_GPIO, GPIO_OUT);
+  gpio_put(ISR_GPIO, 0) ;
+
+  // Map SPI signals to GPIO ports
+  gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
+  gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
+  gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
+  gpio_set_function(PIN_CS, GPIO_FUNC_SPI) ;
+
+  // === build the sine lookup table =======
+  // scaled to produce values between 0 and 4096
+  int ii;
+  for (ii = 0; ii &lt; sine_table_size; ii++){
+        sin_table[ii] = (int)(2047*sin((float)ii*6.283/(float)sine_table_size));
+  }
+
+      // Enable the interrupt for the alarm (we&#x27;re using Alarm 0)
+  hw_set_bits(&amp;timer_hw-&gt;inte, 1u &lt;&lt; ALARM_NUM) ;
+  // Associate an interrupt handler with the ALARM_IRQ
+  irq_set_exclusive_handler(ALARM_IRQ, alarm_irq) ;
+  // Enable the alarm interrupt
+  irq_set_enabled(ALARM_IRQ, true) ;
+  // Write the lower 32 bits of the target time to the alarm register, arming it.
+  timer_hw-&gt;alarm[ALARM_NUM] = timer_hw-&gt;timerawl + DELAY ;
+
+  // set up LED gpio 25
+  gpio_init(LED_PIN) ;  
+  gpio_set_dir(LED_PIN, GPIO_OUT) ;
+  gpio_put(LED_PIN, true);
+
+    ////////////////// KEYPAD INITS ///////////////////////
+  // Initialize the keypad GPIO&#x27;s
+  gpio_init_mask((0x7F &lt;&lt; BASE_KEYPAD_PIN)) ;
+  gpio_set_dir((BASE_KEYPAD_PIN+4), GPIO_IN);
+  gpio_set_dir((BASE_KEYPAD_PIN+5), GPIO_IN);
+  gpio_set_dir((BASE_KEYPAD_PIN+6), GPIO_IN);
+  // Set row-pins to output
+  gpio_set_dir_out_masked((0xF &lt;&lt; BASE_KEYPAD_PIN)) ;
+  // Set all output pins to low
+  gpio_put_masked((0xF &lt;&lt; BASE_KEYPAD_PIN), (0xF &lt;&lt; BASE_KEYPAD_PIN)) ;
+  // Turn on pulldown resistors for column pins (on by default)
+  gpio_pull_up((BASE_KEYPAD_PIN+4)) ;
+  gpio_pull_up((BASE_KEYPAD_PIN+5)) ;
+  gpio_pull_up((BASE_KEYPAD_PIN+6)) ;
+
+  // === config threads ========================
+  pt_add_thread(protothread_toggle25);
+  pt_add_thread(protothread_core_0);
+  pt_add_thread(protothread_amplitude);
+  pt_add_thread(protothread_playback);
+  pt_add_thread(protothread_recording);
+  
+  // === initalize the scheduler ===============
+  pt_schedule_start ;
+
+  // Nothing happening here
+  while(1){
+  }
+  return 0;
+} // end main</code></pre>
+<h2>CMakeLists.txt</h2>
+<p>Build configuration selects only ADC_DDS_keypad_speedup.c as the application source and targets pico2.</p>
+<pre><code># == DO NOT EDIT THE FOLLOWING LINES for the Raspberry Pi Pico VS Code Extension to work ==
+if(WIN32)
+    set(USERHOME $ENV{USERPROFILE})
+else()
+    set(USERHOME $ENV{HOME})
+endif()
+set(sdkVersion 2.3.0)
+set(toolchainVersion 15_2_Rel1)
+set(picotoolVersion 2.3.0)
+set(picoVscode ${USERHOME}/.pico-sdk/cmake/pico-vscode.cmake)
+if (EXISTS ${picoVscode})
+    include(${picoVscode})
+endif()
+# ====================================================================================
+set(PICO_BOARD pico2 CACHE STRING &quot;Board type&quot;)
+
+# cmake version
+cmake_minimum_required(VERSION 3.13)
+
+# include the sdk.cmake file
+include(pico_sdk_import.cmake)
+
+# give the project a name (anything you want)
+project(Audio_Timer_Interrupt_DDS C CXX ASM)
+
+# initialize the sdk
+pico_sdk_init()
+
+add_executable(Audio_Timer_Interrupt_DDS)
+
+target_sources(Audio_Timer_Interrupt_DDS PRIVATE ADC_DDS_keypad_speedup.c)
+
+target_link_libraries(  Audio_Timer_Interrupt_DDS 
+                        pico_stdlib 
+                        pico_bootsel_via_double_reset 
+                        hardware_spi 
+                        hardware_timer 
+                        hardware_irq 
+                        pico_stdlib 
+                        pico_sync
+                        hardware_sync
+                        hardware_clocks
+                        hardware_vreg
+                        hardware_clocks
+                        hardware_adc
+                        hardware_pio
+                        hardware_dma)
+
+pico_add_extra_outputs(Audio_Timer_Interrupt_DDS)</code></pre></body></html>
