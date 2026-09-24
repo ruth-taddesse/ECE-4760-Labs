@@ -74,10 +74,14 @@ typedef signed int fix15 ;
 #define divfix(a,b) ((fix15)div_s64s64((long long)(a) * 32768LL, (long long)(b)))
 
 // Wall detection
-#define hitBottom(b) (b>int2fix15(380 - BALL_RADIUS))
-#define hitTop(b) (b<int2fix15(100 + BALL_RADIUS))
-#define hitLeft(a) (a<int2fix15(100 + BALL_RADIUS))
-#define hitRight(a) (a>int2fix15(540 - BALL_RADIUS))
+#define ARENA_LEFT 50
+#define ARENA_TOP 50
+#define ARENA_RIGHT 590
+#define ARENA_BOTTOM 450
+#define hitBottom(b) (b>int2fix15(ARENA_BOTTOM - BALL_RADIUS))
+#define hitTop(b) (b<int2fix15(ARENA_TOP + BALL_RADIUS))
+#define hitLeft(a) (a<int2fix15(ARENA_LEFT + BALL_RADIUS))
+#define hitRight(a) (a>int2fix15(ARENA_RIGHT - BALL_RADIUS))
 
 //a and b pin for rotary encoder
 #define a_pin 14
@@ -91,7 +95,7 @@ volatile int count = 0;
 void print_to_vga(int number){
   snprintf(text, sizeof(text), "%d", number);
 
-  setCursor(20, 20);             // Position: x, y in pixels
+  setCursor(ARENA_LEFT + 10, ARENA_TOP + 10);
   setTextColor2(WHITE, BLACK);   // Text color, background color
   setTextSize(2);                // 2× normal text size
   writeString(text);
@@ -159,19 +163,19 @@ void spawnBall(fix15* x, fix15* y, fix15* vx, fix15* vy)
 {
   // start in top of screen
   *x = int2fix15(320) ;
-  *y = int2fix15(175 + BALL_RADIUS) ;
+  *y = int2fix15(125 + BALL_RADIUS) ;
   // small, randomized horizontal velocity: -1 to +1 pixels/frame
-  *vx = float2fix15(0.5f * ((float)rand() / RAND_MAX) - 0.25f) ;
+  *vx = float2fix15(0.25f * ((float)rand() / RAND_MAX) - 0.125f) ;
   // zero vertical velocity
   *vy = int2fix15(0) ;
 }
 
 // Draw the boundaries
 void drawArena() {
-  drawVLine(100, 100, 280, WHITE) ;
-  drawVLine(540, 100, 280, WHITE) ;
-  drawHLine(100, 100, 440, WHITE) ;
-  drawHLine(100, 380, 440, WHITE) ;
+  drawVLine(ARENA_LEFT, ARENA_TOP, ARENA_BOTTOM - ARENA_TOP, WHITE) ;
+  drawVLine(ARENA_RIGHT, ARENA_TOP, ARENA_BOTTOM - ARENA_TOP, WHITE) ;
+  drawHLine(ARENA_LEFT, ARENA_TOP, ARENA_RIGHT - ARENA_LEFT, WHITE) ;
+  drawHLine(ARENA_LEFT, ARENA_BOTTOM, ARENA_RIGHT - ARENA_LEFT, WHITE) ;
 }
 
 void initAudio() { // 40 ms decaying tone
