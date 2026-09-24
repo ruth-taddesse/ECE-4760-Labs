@@ -100,7 +100,7 @@ fix15 ball_vy ;
 
 // Singular, stationary peg (stored in fixed-point pixels)
 static const fix15 peg_x = int2fix15(320);
-static const fix15 peg_y = int2fix15(135);
+static const fix15 peg_y = int2fix15(250);
 
 // audio related constants + storage
 
@@ -116,9 +116,9 @@ void spawnBall(fix15* x, fix15* y, fix15* vx, fix15* vy)
 {
   // start in top of screen
   *x = int2fix15(320) ;
-  *y = int2fix15(100 + BALL_RADIUS) ;
+  *y = int2fix15(175 + BALL_RADIUS) ;
   // small, randomized horizontal velocity: -1 to +1 pixels/frame
-  *vx = float2fix15(2.0f * ((float)rand() / RAND_MAX) - 1.0f) ;
+  *vx = float2fix15(0.5f * ((float)rand() / RAND_MAX) - 0.25f) ;
   // zero vertical velocity
   *vy = int2fix15(0) ;
 }
