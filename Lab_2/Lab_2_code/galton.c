@@ -79,6 +79,49 @@ typedef signed int fix15 ;
 #define hitLeft(a) (a<int2fix15(100 + BALL_RADIUS))
 #define hitRight(a) (a>int2fix15(540 - BALL_RADIUS))
 
+//a and b pin for rotary encoder
+#define a_pin 14
+#define b_pin 15
+
+// the color of the boid
+char color = WHITE ;
+char text[16];
+volatile int count = 0;
+
+void print_to_vga(int number){
+  snprintf(text, sizeof(text), "%d", number);
+
+  setCursor(20, 20);             // Position: x, y in pixels
+  setTextColor2(WHITE, BLACK);   // Text color, background color
+  setTextSize(2);                // 2× normal text size
+  writeString(text);
+}
+
+void gpio_callback(uint gpio, uint32_t event_mask) {
+
+    if (gpio_get(b_pin)){
+      count++;
+    }
+
+    else{
+      count--;
+    }
+}
+
+static PT_THREAD (protothread_draw_count(struct pt *pt))
+{
+    // Mark beginning of thread
+    PT_BEGIN(pt);
+
+    while(1) {
+      PT_YIELD_UNTIL(pt, draw_start_signal());
+      clearLowFrame(0, BLACK);
+      print_to_vga(count);
+      
+    } // END WHILE(1)
+  PT_END(pt);
+} // animation thread
+
 // the color of the ball
 char ball_color = WHITE ;
 
@@ -354,9 +397,24 @@ int main(){
   // initialize random seed generator
   srand((unsigned int)time(NULL));
 
+  //initialize rotary A
+  gpio_init(a_pin) ;
+  gpio_set_dir(a_pin, GPIO_IN) ;
+  gpio_pull_up(a_pin) ;
+
+  // initialize rotary B
+  gpio_init(b_pin);
+  gpio_pull_up(b_pin) ;
+  gpio_set_dir(b_pin, GPIO_IN);
+
+  //interrupt on A fall
+  gpio_set_irq_enabled_with_callback(a_pin, GPIO_IRQ_EDGE_FALL, true, &gpio_callback);
+
+
   // add threads
   pt_add_thread(protothread_serial);
   pt_add_thread(protothread_anim);
+  pt_add_thread(protothread_draw_count);
 
   // start scheduler
   pt_schedule_start ;
