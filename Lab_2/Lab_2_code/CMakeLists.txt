@@ -50,6 +50,7 @@ target_link_libraries(  VGA_Animation_Demo
                         pico_multicore
                         pico_sync
                         pico_bootsel_via_double_reset
+                        pico_multicore
                         hardware_pio
                         hardware_dma
                         hardware_adc

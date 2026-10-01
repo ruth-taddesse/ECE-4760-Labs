@@ -574,12 +574,12 @@ int main(){
   //initialize rotary A
   gpio_init(a_pin) ;
   gpio_set_dir(a_pin, GPIO_IN) ;
-  gpio_pull_up(a_pin) ;
+  //gpio_pull_up(a_pin) ;
 
   // initialize rotary B
   gpio_init(b_pin);
   gpio_pull_up(b_pin) ;
-  gpio_set_dir(b_pin, GPIO_IN);
+  //gpio_set_dir(b_pin, GPIO_IN);
 
   // interrupt on A fall
   gpio_set_irq_enabled_with_callback(a_pin, GPIO_IRQ_EDGE_FALL, true, gpio_callback);
