@@ -48,7 +48,7 @@ typedef signed int fix15 ;
 #define divfix(a,b) ((fix15)div_s64s64((long long)(a) * 32768LL, (long long)(b)))
 
 // ball-related constants
-#define BALL_SPAWN_Y 50
+#define BALL_SPAWN_Y 20
 #define BALL_EXIT_Y 450
 
 //a and b pin for rotary encoder
@@ -60,9 +60,9 @@ typedef signed int fix15 ;
 
 // histogram location + layout constants
 #define HISTOGRAM_BASELINE 470
-#define HISTOGRAM_HEIGHT 70
-#define BAR_WIDTH 8
-#define BAR_SPACING 10
+#define HISTOGRAM_HEIGHT 90
+#define BAR_WIDTH 20       // width of each bar in pixels
+#define BAR_SPACING PEG_HORIZONTAL_SPACING // spacing between adjacent bins matches row 16 pegs
 
 // lab-defined constants for ball / peg physics
 #define BALL_RADIUS 4
@@ -77,7 +77,7 @@ typedef signed int fix15 ;
 #define PEG_HORIZONTAL_SPACING 38
 #define PEG_VERTICAL_SPACING 19
 #define FIRST_PEG_X 320
-#define FIRST_PEG_Y 100
+#define FIRST_PEG_Y 75
 #define NUM_BINS (PEG_ROWS + 1)
 #define BOTTOM_ROW_START ((PEG_ROWS * (PEG_ROWS - 1)) / 2)
 
