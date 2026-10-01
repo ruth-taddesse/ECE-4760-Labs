@@ -58,22 +58,70 @@ typedef signed int fix15 ;
 #define MAX_BALLS 50
 #define INITIAL_BALLS 10
 
-// the color of the boid
+// histogram location + layout constants
+#define HISTOGRAM_BASELINE 470
+#define HISTOGRAM_HEIGHT 70
+#define BAR_WIDTH 8
+#define BAR_SPACING 10
+
+// lab-defined constants for ball / peg physics
+#define BALL_RADIUS 4
+#define PEG_RADIUS 6
+#define COLLISION_DISTANCE int2fix15(BALL_RADIUS + PEG_RADIUS)
+#define GRAVITY float2fix15(0.37)
+#define BOUNCINESS float2fix15(0.5)
+
+// 16-row Galton board geometry: row n contains n + 1 pegs
+#define PEG_ROWS 16
+#define NUM_PEGS ((PEG_ROWS * (PEG_ROWS + 1)) / 2)
+#define PEG_HORIZONTAL_SPACING 38
+#define PEG_VERTICAL_SPACING 19
+#define FIRST_PEG_X 320
+#define FIRST_PEG_Y 100
+#define NUM_BINS (PEG_ROWS + 1)
+#define BOTTOM_ROW_START ((PEG_ROWS * (PEG_ROWS - 1)) / 2)
+
+// audio playback configuration + DMA storage
+#define SOUND_SAMPLES 1000
+#define SAMPLE_RATE 25000
+
+typedef struct {
+  fix15 x;
+  fix15 y;
+  fix15 vx;
+  fix15 vy;
+} Ball;
+
+typedef struct {
+  fix15 x;
+  fix15 y;
+} Peg;
+
+// coordinate drawing between animation and count threads
+semaphore_t draw_count_start ;
+semaphore_t draw_count_done ;
+
+// initialize balls, pegs, and other global variables
+static Ball balls[MAX_BALLS];
+static uint32_t bin_counts[NUM_BINS];
+static Peg pegs[NUM_PEGS];
+static int bottom_left_x;
 char color = WHITE ;
 char text[64];
 volatile int number_of_balls = INITIAL_BALLS;
 volatile int animated_balls = INITIAL_BALLS;
 volatile uint32_t total_fallen = 0;
 
-// Coordinate drawing between the animation and count threads.
-semaphore_t draw_count_start ;
-semaphore_t draw_count_done ;
+static uint16_t DAC_data[SOUND_SAMPLES];
+static uint16_t *address_pointer = DAC_data;
+static int data_chan, ctrl_chan;
 
 void print_to_vga(int num_balls){
   uint32_t seconds = to_ms_since_boot(get_absolute_time()) / 1000;
 
-  setTextColor2(WHITE, BLACK);   // Text color, background color
-  setTextSize(1);                // 1.5× normal text size
+  // draw stats
+  setTextColor2(WHITE, BLACK);
+  setTextSize(1);
 
   setCursor(10, 20);
   snprintf(text, sizeof(text), "# of balls animated: %d", num_balls);
@@ -86,6 +134,26 @@ void print_to_vga(int num_balls){
   setCursor(10, 40);
   snprintf(text, sizeof(text), "time since boot: %lus", (unsigned long)seconds);
   writeString(text);
+
+  // draw histogram
+  uint32_t max_count = 1;
+
+  for (int i = 0; i < NUM_BINS; i++) {
+    if (bin_counts[i] > max_count) {
+      max_count = bin_counts[i];
+    }
+  }
+
+  for (int i = 0; i < NUM_BINS; i++) {
+    int height = (bin_counts[i] * HISTOGRAM_HEIGHT) / max_count;
+    int bin_x = 10 + i * BAR_SPACING;
+
+    fillRect(bin_x,
+            HISTOGRAM_BASELINE - height,
+            BAR_WIDTH,
+            height,
+            CYAN);
+  }
 }
 
 void gpio_callback(uint gpio, uint32_t event_mask) {
@@ -131,39 +199,7 @@ char ball_color = WHITE ;
 // the color of the peg
 char peg_color = MAGENTA ;
 
-// lab-defined constants
-#define BALL_RADIUS 4
-#define PEG_RADIUS 6
-#define COLLISION_DISTANCE int2fix15(BALL_RADIUS + PEG_RADIUS)
-#define GRAVITY float2fix15(0.37)
-#define BOUNCINESS float2fix15(0.5)
-
-// 16-row Galton board geometry. Row n contains n + 1 pegs.
-#define PEG_ROWS 16
-#define NUM_PEGS ((PEG_ROWS * (PEG_ROWS + 1)) / 2)
-#define PEG_HORIZONTAL_SPACING 38
-#define PEG_VERTICAL_SPACING 19
-#define FIRST_PEG_X 320
-#define FIRST_PEG_Y 100
-
-typedef struct {
-  fix15 x;
-  fix15 y;
-  fix15 vx;
-  fix15 vy;
-} Ball;
-
-static Ball balls[MAX_BALLS];
-
-
-typedef struct {
-  fix15 x;
-  fix15 y;
-} Peg;
-
-static Peg pegs[NUM_PEGS];
-
-// Generate a centered triangular board containing 1 + 2 + ... + 16 pegs.
+// generate galton board with rows of 1 + 2 + ... + 16 pegs
 void generatePegs(void)
 {
   int peg_index = 0;
@@ -191,15 +227,6 @@ void drawPegs(void)
                peg_color);
   }
 }
-
-// audio related constants + storage
-
-#define SOUND_SAMPLES 1000
-#define SAMPLE_RATE 25000
-
-static uint16_t DAC_data[SOUND_SAMPLES];
-static uint16_t *address_pointer = DAC_data;
-static int data_chan, ctrl_chan;
 
 // create a ball
 void spawnBall(fix15* x, fix15* y, fix15* vx, fix15* vy)
@@ -352,6 +379,11 @@ void updateBall(fix15* x, fix15* y, fix15* vx, fix15* vy)
 
   // ball exit logic
   if (*y > int2fix15(BALL_EXIT_Y)) {
+    int bin = (fix2int15(*x) - bottom_left_x + PEG_HORIZONTAL_SPACING / 2) / PEG_HORIZONTAL_SPACING;
+    if (bin < 0) bin = 0;
+    if (bin >= NUM_BINS) bin = NUM_BINS - 1;
+    bin_counts[bin]++;
+
     total_fallen++;
     spawnBall(x, y, vx, vy);
     return;
@@ -439,6 +471,7 @@ static PT_THREAD (protothread_anim(struct pt *pt))
 
       // draw all 136 pegs in the 16-row board
       drawPegs();
+
       // Let the count thread finish this frame before starting another.
       PT_SEM_SDK_SIGNAL(pt, &draw_count_start) ;
       PT_SEM_SDK_WAIT(pt, &draw_count_done) ;
@@ -476,6 +509,7 @@ int main(){
 
   // Generate the fixed peg positions once at startup.
   generatePegs();
+  bottom_left_x = fix2int15(pegs[BOTTOM_ROW_START].x);
 
   // initialize random seed generator
   srand((unsigned int)time(NULL));
