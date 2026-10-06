@@ -54,8 +54,8 @@ typedef signed int fix15 ;
 #define a_pin 14
 #define b_pin 15
 
-#define MAX_BALLS 5000
-#define INITIAL_BALLS 10
+#define MAX_BALLS 7500
+#define INITIAL_BALLS 3500
 
 // histogram location + layout constants
 #define HISTOGRAM_BASELINE 470
@@ -160,13 +160,22 @@ static inline uint32_t quotient_small(uint64_t numerator, uint32_t divisor,
     return quotient;
 }
 
+// Collision components are bounded by the 10-pixel collision box. After
+// three reciprocal refinements, the estimated Q15 normal is within one unit.
+// Convert the 32-bit component before scaling, avoiding uint64-to-float helpers.
 static inline fix15 collision_normal(fix15 component, uint32_t distance,
-                                      float reciprocal)
+                                      float scaled_reciprocal)
 {
     uint32_t magnitude = (uint32_t)absfix15(component);
-    fix15 normal = (fix15)quotient_small((uint64_t)magnitude << 15,
-                                        distance, reciprocal);
-    return component < 0 ? -normal : normal;
+    uint32_t normal = (uint32_t)((float)magnitude * scaled_reciprocal);
+    uint64_t numerator = (uint64_t)magnitude << 15;
+    uint64_t product = (uint64_t)normal * distance;
+    if (product > numerator) {
+        --normal;
+    } else if (numerator - product >= distance) {
+        ++normal;
+    }
+    return component < 0 ? -(fix15)normal : (fix15)normal;
 }
 
 typedef struct {
@@ -222,7 +231,8 @@ volatile uint32_t bounciness = float2fix15(0.5);
 static const int8_t ball_half_width[9] = {
     0, 2, 3, 3, 4, 3, 3, 2, 0
 };
-static uint8_t ball_line_width[9];
+// VGA stores even x in the low nibble and odd x in the high nibble.
+extern char *current_draw_buffer;
 
 static uint16_t DAC_data[SOUND_SAMPLES];
 static uint16_t *address_pointer = DAC_data;
@@ -385,16 +395,36 @@ void generatePegs(void)
   }
 }
 
+// Specialized radius-4 sprite: contiguous packed-byte writes, no line calls.
+// Only core 0 renders, so overlapping balls cannot race on shared pixel bytes.
 static void drawBall(int x, int y, char color) {
-  const int top_y = y - BALL_RADIUS;
-  for (int row = 0; row < 9; row++) {
-        int half_width = ball_half_width[row];
-        drawHLine(
-            x - half_width,
-            top_y + row,
-            ball_line_width[row],
-            color
-        );
+    if (x < -BALL_RADIUS || x >= 640 + BALL_RADIUS ||
+        y < -BALL_RADIUS || y >= 480 + BALL_RADIUS) return;
+    uint8_t *buffer = (uint8_t *)current_draw_buffer;
+    const uint8_t pixel = (uint8_t)color & 15u;
+    const uint8_t pair = pixel | (pixel << 4);
+    const bool inside = x >= BALL_RADIUS && x < 640 - BALL_RADIUS &&
+                        y >= BALL_RADIUS && y < 480 - BALL_RADIUS;
+    for (int row = 0; row < 9; ++row) {
+        int py = y + row - BALL_RADIUS;
+        int left = x - ball_half_width[row];
+        int right = x + ball_half_width[row];
+        if (!inside) {
+            if (py < 0 || py >= 480 || right < 0 || left >= 640) continue;
+            if (left < 0) left = 0;
+            if (right >= 640) right = 639;
+        }
+        uint8_t *dest = buffer + 320 * py + (left >> 1);
+        if (left & 1) {
+            *dest = (*dest & 15u) | (pixel << 4);
+            ++dest;
+            ++left;
+        }
+        while (left + 1 <= right) {
+            *dest++ = pair;
+            left += 2;
+        }
+        if (left <= right) *dest = (*dest & 240u) | pixel;
     }
 }
 
@@ -566,7 +596,8 @@ static bool updateBallPhysics(Ball *ball, fix15 bounce)
             normal_x = 0;
             normal_y = fallback_normal_y;
         } else {
-            const float inverse_distance = reciprocal_positive((uint32_t)distance);
+            const float inverse_distance =
+                reciprocal_positive((uint32_t)distance) * 32768.0f;
             normal_x = collision_normal(dx, (uint32_t)distance, inverse_distance);
             normal_y = collision_normal(dy, (uint32_t)distance, inverse_distance);
         }
@@ -617,12 +648,12 @@ static void core1_entry(void)
     }
 }
 
-// Runs only on core 0, after both cores finish physics.
-static void finishBallUpdates(int count)
+// Runs on core 0, only for a range whose physics has finished.
+static bool finishBallUpdates(int begin, int end)
 {
     bool play_sound = false;
 
-    for (int i = 0; i < count; i++) {
+    for (int i = begin; i < end; i++) {
         Ball *ball = &balls[i];
 
         if (ball_hit_peg[i]) {
@@ -663,10 +694,7 @@ static void finishBallUpdates(int count)
         }
     }
 
-    // Only core 0 touches the audio DMA.
-    if (play_sound) {
-        triggerSound();
-    }
+    return play_sound;
 }
 
 static PT_THREAD(protothread_draw_count(struct pt *pt))
@@ -718,6 +746,8 @@ static PT_THREAD(protothread_anim(struct pt *pt))
 {
     static int active_balls;
     static int requested_balls;
+    static int draw_begin;
+    static bool play_sound;
 
     PT_BEGIN(pt);
 
@@ -732,7 +762,6 @@ static PT_THREAD(protothread_anim(struct pt *pt))
     while (1) {
         PT_YIELD_UNTIL(pt, draw_start_signal());
 
-        clearLowFrame(0, BLACK);
 
         // Atomically consume the ISR's reset request.
         // Interrupts are disabled only for this short exchange.
@@ -763,33 +792,45 @@ static PT_THREAD(protothread_anim(struct pt *pt))
         active_balls = requested_balls;
         animated_balls = active_balls;
 
+        draw_begin = 0;
         if (physics_countdown == 0) {
           // Publish this update's settings before waking core 1.
           frame_bounce = (fix15)bounciness;
 
-          worker_begin = active_balls >> 1;
+          // Give core 1 more physics while core 0 also clears and renders.
+          worker_begin = active_balls >> 2;
           worker_end = active_balls;
 
           sem_release(&physics_start);
 
-          // Core 0 updates the first half concurrently.
+          clearLowFrame(0, BLACK);
+
+          // Core 0 updates the first quarter concurrently.
           for (int i = 0; i < worker_begin; i++) {
               ball_hit_peg[i] =
                   updateBallPhysics(&balls[i], frame_bounce);
           }
 
-          // Only wait when we actually submitted work.
+          // Draw only our completed range while core 1 updates its own range.
+          play_sound = finishBallUpdates(0, worker_begin);
+          for (int i = 0; i < worker_begin; ++i) {
+              drawBall(fix2int15(balls[i].x), fix2int15(balls[i].y), ball_color);
+          }
+
+          // Do not read core 1's positions until its semaphore is released.
           PT_SEM_SDK_WAIT(pt, &physics_done);
 
-          // Process collision flags and exits once per physics update.
-          finishBallUpdates(active_balls);
+          play_sound |= finishBallUpdates(worker_begin, active_balls);
+          if (play_sound) triggerSound();
+          draw_begin = worker_begin;
 
           physics_countdown = physics_countdown_reset;
       } else {
            physics_countdown--;
+           clearLowFrame(0, BLACK);
       }
 
-        for (int i = 0; i < active_balls; i++) {
+        for (int i = draw_begin; i < active_balls; i++) {
             drawBall(
                 fix2int15(balls[i].x),
                 fix2int15(balls[i].y),
@@ -823,9 +864,6 @@ int main(){
   bin_position_offset = (PEG_HORIZONTAL_SPACING >> 1) - pegs[BOTTOM_ROW_START].pixel_x;
   for (int i = 0; i < NUM_BINS; i++) {
     bin_pixel_x[i] = 10 + i * BAR_SPACING;
-  }
-  for (int row = 0; row < 9; row++) {
-    ball_line_width[row] = 2 * ball_half_width[row] + 1;
   }
 
   // initialize random seed generator
