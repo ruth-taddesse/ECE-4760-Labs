@@ -1,0 +1,69 @@
+# Galton background DMA
+
+`initVGAWithBackground(galton_background)` selects the background pipeline.
+`initVGA()` retains the original driver for other demos. The background mode
+requires `DOUBLE_BUFFER_60` and owns DMA IRQ 1 and the XIP streaming FIFO.
+It claims six DMA channels; audio claims its two separately.
+
+At RGB transfer completion, a short RAM-resident interrupt handler selects the
+next display/draw buffers and prepares a background copy if a back buffer is free.
+The control DMA chain is:
+
+```text
+Display-pointer DMA -> Draw-pointer DMA -> Dispatch DMA
+                                            |        |
+                                            |        +-> Background DMA -> Start-flag DMA
+                                            +-> RGB DMA
+```
+
+Dispatch writes a channel mask to the DMA multi-channel trigger register.
+RGB restarts without waiting for the background copy. The copy reads 19,200
+32-bit words from `XIP_AUX_BASE`, paced by `DREQ_XIP_STREAM`, and writes them
+to the back buffer. Flash streaming supplies the FIFO in flash idle cycles;
+DMA does not issue long-latency reads against the memory-mapped flash window.
+This uses neither a pacing timer nor a third RAM framebuffer.
+
+The copy completion chains to a one-word DMA transfer setting `start_flag`.
+The animation thread therefore receives a buffer containing the pegs and fixed
+labels. It draws balls and then waits for the count thread to draw the numbers
+and histogram. Only then does `vga_frame_done()` publish the completed frame.
+
+If the copy or renderer takes longer than one display interval, the display
+repeats its front buffer. The back buffer stays exclusively owned by the copy
+or renderer, and no second copy is launched into it. Buffer swaps happen only
+after publication. This avoids overwriting an unfinished frame, though it
+cannot guarantee 60 rendered frames per second or recover a PIO FIFO underrun.
+Physics N counts rendered animation iterations, not repeated display refreshes.
+
+The generator builds the flash image from the current peg geometry and GLCD
+font. Pegs are magenta, labels are white, and the rest is black. Balls render
+on top of this background. Numbers are formatted only when changed, but must
+still be drawn after each restoration.
+
+## Hardware validation
+
+Watch these symbols without leaving the CPU halted (PIO continues while halted):
+
+- `vga_rgb_stall_count`: sampled intervals with RGB FIFO starvation, excluding
+  the initial sample. It should remain zero. It is not an exact stall count.
+- `vga_repeated_frames`: display intervals in which the next frame was not ready.
+  Growth under load is expected; it indicates reduced rendered frame rate.
+
+Measure the rendered frame rate and CPU load on the Pico before claiming a
+speedup. The flash bandwidth cost remains, even with this improved DMA path.
+
+## Four-color framebuffer format
+
+Each framebuffer is 76,800 bytes: 160 bytes per row, four pixels per byte.
+The leftmost pixel is in bits 1:0. Palette indices 0/1/2/3 produce
+BLACK/MAGENTA/CYAN/WHITE (VGA pin values 0/12/7/15).
+
+`rgb4.pio` runs on PIO1 SM0 and expands each index with an instruction lookup
+at PIO address zero. Sixteen pixels arrive per 32-bit DMA word. Every palette
+branch takes ten system cycles per pixel at the current 250 MHz clock.
+PIO0's HSync and VSync programs remain unchanged; PIO0 SM2 (`line_sync.pio`)
+bridges active-line IRQs onto GPIO22 for PIO1. GPIO22 requires no external wire,
+but must not be connected to another active signal. PIO1 and GPIO22 are reserved.
+
+All drawing and background-generation paths use this packing. Serial ball color
+choices are 1=white, 2=magenta, 3=cyan. The physical VGA resistor wiring is unchanged.

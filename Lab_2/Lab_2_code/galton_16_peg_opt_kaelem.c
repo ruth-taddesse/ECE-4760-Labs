@@ -5,6 +5,8 @@ Lab 2, Milestone 1 - simple Galton Board with 1 peg
 
 // Include the VGA grahics library
 #include "VGA/vga16_graphics_v3.h"
+#include "galton_background.h"
+_Static_assert(sizeof(galton_background) == VGA_FRAME_BYTES, "Background format mismatch");
 // Include standard libraries
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,8 +56,8 @@ typedef signed int fix15 ;
 #define a_pin 14
 #define b_pin 15
 
-#define MAX_BALLS 7500
-#define INITIAL_BALLS 3500
+#define MAX_BALLS 44500
+#define INITIAL_BALLS 44000
 
 // histogram location + layout constants
 #define HISTOGRAM_BASELINE 470
@@ -91,7 +93,7 @@ typedef signed int fix15 ;
 #define SAMPLE_RATE 25000
 
 // 1 = physics every frame, 2 = every other frame, etc.
-#define PHYSICS_EVERY_N_FRAMES 2
+#define PHYSICS_EVERY_N_FRAMES 1
 
 // Compute invariant physics values once, outside the per-ball updates.
 static const fix15 spawn_x = int2fix15(FIRST_PEG_X);
@@ -179,11 +181,51 @@ static inline fix15 collision_normal(fix15 component, uint32_t distance,
 }
 
 typedef struct {
-  fix15 x;
-  fix15 y;
-  fix15 vx;
-  fix15 vy;
+  int16_t x; // signed fixed point: 5 fractional bits (1/32 pixel)
+  int16_t y;
+  int16_t vx; // signed fixed point: 8 fractional bits (1/256 pixel per frame)
+  int16_t vy;
 } Ball;
+_Static_assert(sizeof(Ball) == 8, "Ball storage must remain 8 bytes");
+_Static_assert(BALL_EXIT_Y * 32 + 1 < INT16_MAX, "Exit marker must fit Q5");
+
+// Q15 <-> signed Q5 positions. INT16_MIN in y is reserved for an escaped ball
+// that core 0 must respawn without adding a false bottom-exit histogram count.
+#define POSITION_ESCAPE INT16_MIN
+static inline int16_t store_position(fix15 position)
+{
+    if (position >= INT16_MAX * 1024) return INT16_MAX;
+    if (position <= INT16_MIN * 1024) return INT16_MIN;
+    if (position >= 0) return (int16_t)((position + 512) >> 10);
+    return (int16_t)(-((-position + 512) >> 10));
+}
+
+static inline fix15 load_position(int16_t position)
+{
+    return (fix15)position * 1024;
+}
+
+static inline int position_pixel(int16_t position)
+{
+    return fix2int15(load_position(position));
+}
+
+// Physics calculations stay Q15; stored positions use Q5 and velocities Q8.
+// Round to nearest, with ties away from zero. Saturate instead of wrapping if
+// energetic collisions exceed [-128, 127.99609375] pixels per frame.
+static inline int16_t store_velocity(fix15 velocity)
+{
+    if (velocity >= INT16_MAX * 128) return INT16_MAX;
+    if (velocity <= INT16_MIN * 128) return INT16_MIN;
+    if (velocity >= 0) return (int16_t)((velocity + 64) >> 7);
+    return (int16_t)(-((-velocity + 64) >> 7));
+}
+
+static inline fix15 load_velocity(int16_t velocity)
+{
+    // Multiplication is defined for negative values; a signed left shift isn't.
+    return (fix15)velocity * 128;
+}
 
 typedef struct {
   fix15 x;
@@ -204,8 +246,9 @@ static int worker_begin;
 static int worker_end;
 static fix15 frame_bounce;
 
-// Each core writes only the entries for its assigned balls.
-static bool ball_hit_peg[MAX_BALLS];
+// Core 1 publishes one aggregate hit flag before signaling physics_done.
+// Core 0 keeps its own aggregate in the animation thread.
+static bool worker_hit_peg;
 
 // Written by the encoder ISR, consumed by core 0 between frames.
 static volatile bool reset_stats_requested = false;
@@ -231,8 +274,8 @@ volatile uint32_t bounciness = float2fix15(0.5);
 static const int8_t ball_half_width[9] = {
     0, 2, 3, 3, 4, 3, 3, 2, 0
 };
-// VGA stores even x in the low nibble and odd x in the high nibble.
-extern char *current_draw_buffer;
+// VGA stores four 2-bit palette indices per byte, leftmost in the low bits.
+extern char * volatile current_draw_buffer;
 
 static uint16_t DAC_data[SOUND_SAMPLES];
 static uint16_t *address_pointer = DAC_data;
@@ -257,21 +300,35 @@ void print_to_vga(int num_balls){
   setTextColor2(WHITE, BLACK);
   setTextSize(1);
 
-  setCursor(10, 20);
-  snprintf(text, sizeof(text), "# of balls animated: %d", num_balls);
-  writeString(text);
-
-  setCursor(10, 30);
-  snprintf(text, sizeof(text), "# of balls fallen: %lu", (unsigned long)total_fallen);
-  writeString(text);
-
-  setCursor(10, 40);
-  snprintf(text, sizeof(text), "bounciness: %.2f", fix2float15(bounciness));
-  writeString(text);
-
-  setCursor(10, 50);
-  snprintf(text, sizeof(text), "time since boot: %lus", (unsigned long)seconds);
-  writeString(text);
+  // Static labels come from flash; only reformat numeric values when changed.
+  // Still redraw values each frame because DMA restores the blank value fields.
+  static char values[4][24];
+  static bool values_valid;
+  static int previous_balls;
+  static uint32_t previous_fallen, previous_bounce, previous_seconds;
+  const uint32_t fallen = total_fallen;
+  const uint32_t bounce = bounciness;
+  if (!values_valid || previous_balls != num_balls) {
+    snprintf(values[0], sizeof(values[0]), "%d", num_balls);
+    previous_balls = num_balls;
+  }
+  if (!values_valid || previous_fallen != fallen) {
+    snprintf(values[1], sizeof(values[1]), "%lu", (unsigned long)fallen);
+    previous_fallen = fallen;
+  }
+  if (!values_valid || previous_bounce != bounce) {
+    snprintf(values[2], sizeof(values[2]), "%.2f", fix2float15(bounce));
+    previous_bounce = bounce;
+  }
+  if (!values_valid || previous_seconds != seconds) {
+    snprintf(values[3], sizeof(values[3]), "%lus", (unsigned long)seconds);
+    previous_seconds = seconds;
+  }
+  values_valid = true;
+  for (int i = 0; i < 4; ++i) {
+    setCursor(background_value_x[i], 20 + 10 * i);
+    writeString(values[i]);
+  }
 
   // Reuse the scale until the maintained maximum changes.
   static uint32_t scaled_max_count = 1;
@@ -401,8 +458,8 @@ static void drawBall(int x, int y, char color) {
     if (x < -BALL_RADIUS || x >= 640 + BALL_RADIUS ||
         y < -BALL_RADIUS || y >= 480 + BALL_RADIUS) return;
     uint8_t *buffer = (uint8_t *)current_draw_buffer;
-    const uint8_t pixel = (uint8_t)color & 15u;
-    const uint8_t pair = pixel | (pixel << 4);
+    const uint8_t pixel = vga_color_index(color);
+    const uint8_t packed = pixel * 0x55u;
     const bool inside = x >= BALL_RADIUS && x < 640 - BALL_RADIUS &&
                         y >= BALL_RADIUS && y < 480 - BALL_RADIUS;
     for (int row = 0; row < 9; ++row) {
@@ -414,17 +471,23 @@ static void drawBall(int x, int y, char color) {
             if (left < 0) left = 0;
             if (right >= 640) right = 639;
         }
-        uint8_t *dest = buffer + 320 * py + (left >> 1);
-        if (left & 1) {
-            *dest = (*dest & 15u) | (pixel << 4);
+        uint8_t *dest = buffer + VGA_ROW_BYTES * py + (left >> 2);
+        if (left & 3) {
+            int count = 4 - (left & 3);
+            if (count > right - left + 1) count = right - left + 1;
+            unsigned mask = ((1u << (2 * count)) - 1u) << (2 * (left & 3));
+            *dest = (*dest & ~mask) | (packed & mask);
             ++dest;
-            ++left;
+            left += count;
         }
-        while (left + 1 <= right) {
-            *dest++ = pair;
-            left += 2;
+        while (left + 3 <= right) {
+            *dest++ = packed;
+            left += 4;
         }
-        if (left <= right) *dest = (*dest & 240u) | pixel;
+        if (left <= right) {
+            unsigned mask = (1u << (2 * (right - left + 1))) - 1u;
+            *dest = (*dest & ~mask) | (packed & mask);
+        }
     }
 }
 
@@ -439,15 +502,14 @@ void drawPegs(void)
 }
 
 // create a ball
-void spawnBall(fix15* x, fix15* y, fix15* vx, fix15* vy)
+void spawnBall(Ball *ball)
 {
-  // start in top of screen
-  *x = spawn_x;
-  *y = spawn_y;
-  // small, randomized horizontal velocity: -1 to +1 pixels/frame
-  *vx = float2fix15(0.25f * ((float)rand() * random_reciprocal) - 0.125f) ;
-  // zero vertical velocity
-  *vy = int2fix15(0) ;
+  ball->x = store_position(spawn_x);
+  ball->y = store_position(spawn_y);
+  // Small randomized horizontal velocity, approximately -0.125 to +0.125.
+  ball->vx = store_velocity(float2fix15(
+      0.25f * ((float)rand() * random_reciprocal) - 0.125f));
+  ball->vy = 0;
 }
 
 void initAudio() { // 40 ms decaying tone
@@ -534,20 +596,24 @@ void triggerSound(void) {
 static bool updateBallPhysics(Ball *ball, fix15 bounce)
 {
     bool hit = false;
+    fix15 x = load_position(ball->x);
+    fix15 y = load_position(ball->y);
+    fix15 vx = load_velocity(ball->vx);
+    fix15 vy = load_velocity(ball->vy);
 
     // Advance N frames using the original position-then-gravity order.
     // Integer multiplication preserves the fixed-point scale.
-    ball->x += ball->vx * PHYSICS_EVERY_N_FRAMES;
-    ball->y += ball->vy * PHYSICS_EVERY_N_FRAMES + gravity_position_step;
+    x += vx * PHYSICS_EVERY_N_FRAMES;
+    y += vy * PHYSICS_EVERY_N_FRAMES + gravity_position_step;
 
     // Velocity entering the final frame's collision check.
     // The remaining gravity step is applied at the function's end.
-    ball->vy += gravity_velocity_step;
+    vy += gravity_velocity_step;
 
     // Find rows intersecting the collision box. Clamp negative coordinates
     // before using unsigned reciprocal multiplication for exact grid indices.
-    const fix15 row_low = ball->y - COLLISION_DISTANCE - first_peg_y;
-    const fix15 row_high = ball->y + COLLISION_DISTANCE - first_peg_y;
+    const fix15 row_low = y - COLLISION_DISTANCE - first_peg_y;
+    const fix15 row_high = y + COLLISION_DISTANCE - first_peg_y;
     if (row_high < 0) {
         goto collision_done;
     }
@@ -558,8 +624,8 @@ static bool updateBallPhysics(Ball *ball, fix15 bounce)
     if (last_row >= PEG_ROWS) last_row = PEG_ROWS - 1;
 
     for (int row = first_row; row <= last_row; row++) {
-      const fix15 column_low = ball->x - COLLISION_DISTANCE - peg_row_left_x[row];
-      const fix15 column_high = ball->x + COLLISION_DISTANCE - peg_row_left_x[row];
+      const fix15 column_low = x - COLLISION_DISTANCE - peg_row_left_x[row];
+      const fix15 column_high = x + COLLISION_DISTANCE - peg_row_left_x[row];
       if (column_high < 0) continue;
 
       const int first_column = column_low > 0 ?
@@ -570,8 +636,8 @@ static bool updateBallPhysics(Ball *ball, fix15 bounce)
 
       for (int column = first_column; column <= last_column; column++) {
         const int i = peg_row_start[row] + column;
-        fix15 dx = ball->x - pegs[i].x;
-        fix15 dy = ball->y - pegs[i].y;
+        fix15 dx = x - pegs[i].x;
+        fix15 dy = y - pegs[i].y;
 
         if (absfix15(dx) >= COLLISION_DISTANCE ||
             absfix15(dy) >= COLLISION_DISTANCE) {
@@ -602,23 +668,23 @@ static bool updateBallPhysics(Ball *ball, fix15 bounce)
             normal_y = collision_normal(dy, (uint32_t)distance, inverse_distance);
         }
 
-        fix15 dir = multfix15(ball->vx, normal_x) +
-                    multfix15(ball->vy, normal_y);
+        fix15 dir = multfix15(vx, normal_x) +
+                    multfix15(vy, normal_y);
 
         if (dir < 0) {
             fix15 impulse = -2 * dir;
 
-            ball->vx += multfix15(normal_x, impulse);
-            ball->vy += multfix15(normal_y, impulse);
+            vx += multfix15(normal_x, impulse);
+            vy += multfix15(normal_y, impulse);
 
-            ball->vx = multfix15(ball->vx, bounce);
-            ball->vy = multfix15(ball->vy, bounce);
+            vx = multfix15(vx, bounce);
+            vy = multfix15(vy, bounce);
 
             hit = true;
         }
 
-        ball->x = pegs[i].x + multfix15(normal_x, collision_separation);
-        ball->y = pegs[i].y + multfix15(normal_y, collision_separation);
+        x = pegs[i].x + multfix15(normal_x, collision_separation);
+        y = pegs[i].y + multfix15(normal_y, collision_separation);
         // Preserve the original first-collision-only behavior across both loops.
         goto collision_done;
       }
@@ -626,10 +692,25 @@ static bool updateBallPhysics(Ball *ball, fix15 bounce)
 
 collision_done:
     // Core 0 will respawn exiting balls after both cores finish.
-    if (ball->y <= exit_y) {
-        ball->vy += GRAVITY;
+    if (y <= exit_y) {
+        vy += GRAVITY;
     }
 
+    if (y > exit_y) {
+        // Preserve bottom-exit detection even if rounding would return y to 400.
+        // Clamping an offscreen x still selects the same outer histogram bin.
+        ball->x = store_position(x);
+        ball->y = (int16_t)(BALL_EXIT_Y * 32 + 1);
+    } else if (x < INT16_MIN * 1024 || x > INT16_MAX * 1024 ||
+               y <= INT16_MIN * 1024) {
+        ball->x = 0;
+        ball->y = POSITION_ESCAPE;
+    } else {
+        ball->x = store_position(x);
+        ball->y = store_position(y);
+    }
+    ball->vx = store_velocity(vx);
+    ball->vy = store_velocity(vy);
     return hit;
 }
 
@@ -639,29 +720,31 @@ static void core1_entry(void)
     while (true) {
         sem_acquire_blocking(&physics_start);
 
+        bool hit = false;
         for (int i = worker_begin; i < worker_end; i++) {
-            ball_hit_peg[i] =
-                updateBallPhysics(&balls[i], frame_bounce);
+            // Bitwise OR evaluates every update, even after a previous hit.
+            hit |= updateBallPhysics(&balls[i], frame_bounce);
         }
-
+        worker_hit_peg = hit;
         sem_release(&physics_done);
     }
 }
 
 // Runs on core 0, only for a range whose physics has finished.
-static bool finishBallUpdates(int begin, int end)
+static void finishBallUpdates(int begin, int end)
 {
-    bool play_sound = false;
 
     for (int i = begin; i < end; i++) {
         Ball *ball = &balls[i];
 
-        if (ball_hit_peg[i]) {
-            play_sound = true;
+        if (ball->y == POSITION_ESCAPE) {
+            // An energetic ball left the representable area; don't wrap or
+            // pin it at an edge, and don't count it as a bottom exit.
+            spawnBall(ball);
+            continue;
         }
-
-        if (ball->y > exit_y) {
-            const int bin_position = fix2int15(ball->x) + bin_position_offset;
+        if (ball->y > BALL_EXIT_Y * 32) {
+            const int bin_position = position_pixel(ball->x) + bin_position_offset;
             int bin = bin_position > 0 ?
                 (int)quotient_constant((uint32_t)bin_position,
                                       PEG_HORIZONTAL_SPACING, bin_reciprocal) : 0;
@@ -689,12 +772,10 @@ static bool finishBallUpdates(int begin, int end)
             total_fallen++;
 
             // Keep rand() and spawning on core 0.
-            spawnBall(&ball->x, &ball->y,
-                      &ball->vx, &ball->vy);
+            spawnBall(ball);
         }
     }
 
-    return play_sound;
 }
 
 static PT_THREAD(protothread_draw_count(struct pt *pt))
@@ -726,7 +807,7 @@ static PT_THREAD (protothread_serial(struct pt *pt))
     serial_write ;
       while(1) {
         // print prompt
-        sprintf(pt_serial_out_buffer, "input a number in the range 1-15: ");
+        sprintf(pt_serial_out_buffer, "ball color: 1=white, 2=magenta, 3=cyan: ");
         // non-blocking write
         serial_write ;
         // spawn a thread to do the non-blocking serial read
@@ -734,9 +815,9 @@ static PT_THREAD (protothread_serial(struct pt *pt))
         // convert input string to number
         sscanf(pt_serial_in_buffer,"%d", &user_input) ;
         // update ball color
-        if ((user_input > 0) && (user_input < 16)) {
-          ball_color = (char)user_input ;
-        }
+        if (user_input == 1) ball_color = WHITE;
+        else if (user_input == 2) ball_color = MAGENTA;
+        else if (user_input == 3) ball_color = CYAN;
       } // END WHILE(1)
   PT_END(pt);
 } // timer thread
@@ -755,8 +836,7 @@ static PT_THREAD(protothread_anim(struct pt *pt))
     animated_balls = active_balls;
 
     for (int i = 0; i < active_balls; i++) {
-        spawnBall(&balls[i].x, &balls[i].y,
-                  &balls[i].vx, &balls[i].vy);
+        spawnBall(&balls[i]);
     }
 
     while (1) {
@@ -784,8 +864,7 @@ static PT_THREAD(protothread_anim(struct pt *pt))
             for (int i = active_balls;
                  i < requested_balls;
                  i++) {
-                spawnBall(&balls[i].x, &balls[i].y,
-                          &balls[i].vx, &balls[i].vy);
+                spawnBall(&balls[i]);
             }
         }
 
@@ -803,44 +882,46 @@ static PT_THREAD(protothread_anim(struct pt *pt))
 
           sem_release(&physics_start);
 
-          clearLowFrame(0, BLACK);
+          // Background DMA completed before draw_start_signal().
 
-          // Core 0 updates the first quarter concurrently.
+          // Reset the aggregate for each physics job, including empty ranges.
+          play_sound = false;
           for (int i = 0; i < worker_begin; i++) {
-              ball_hit_peg[i] =
-                  updateBallPhysics(&balls[i], frame_bounce);
+              play_sound |= updateBallPhysics(&balls[i], frame_bounce);
           }
 
           // Draw only our completed range while core 1 updates its own range.
-          play_sound = finishBallUpdates(0, worker_begin);
+          finishBallUpdates(0, worker_begin);
           for (int i = 0; i < worker_begin; ++i) {
-              drawBall(fix2int15(balls[i].x), fix2int15(balls[i].y), ball_color);
+              drawBall(position_pixel(balls[i].x), position_pixel(balls[i].y), ball_color);
           }
 
           // Do not read core 1's positions until its semaphore is released.
           PT_SEM_SDK_WAIT(pt, &physics_done);
 
-          play_sound |= finishBallUpdates(worker_begin, active_balls);
+          play_sound |= worker_hit_peg;
+          finishBallUpdates(worker_begin, active_balls);
           if (play_sound) triggerSound();
           draw_begin = worker_begin;
 
           physics_countdown = physics_countdown_reset;
       } else {
            physics_countdown--;
-           clearLowFrame(0, BLACK);
+           // Background DMA completed before draw_start_signal().
       }
 
         for (int i = draw_begin; i < active_balls; i++) {
             drawBall(
-                fix2int15(balls[i].x),
-                fix2int15(balls[i].y),
+                position_pixel(balls[i].x),
+                position_pixel(balls[i].y),
                 ball_color);
         }
 
-        drawPegs();
+        // Pegs and fixed labels are in the DMA-restored background.
 
         PT_SEM_SDK_SIGNAL(pt, &draw_count_start);
         PT_SEM_SDK_WAIT(pt, &draw_count_done);
+        vga_frame_done(); // Publish only after both drawing threads finish.
     }
 
     PT_END(pt);
@@ -856,7 +937,7 @@ int main(){
   stdio_init_all() ;
 
   // initialize VGA + audio
-  initVGA() ;
+  initVGAWithBackground(galton_background);
   initAudio();
 
   // Generate the fixed peg positions once at startup.

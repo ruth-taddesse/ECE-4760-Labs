@@ -1,0 +1,20 @@
+; Bridge the existing PIO0 active-line IRQ to PIO1 through an unused GPIO.
+; GPIO22 is reserved for this internal signal and needs no external connection.
+.program line_sync
+.wrap_target
+wait 1 irq 1
+set pins, 1 [7]
+set pins, 0
+.wrap
+
+% c-sdk {
+static inline void line_sync_program_init(PIO pio, uint sm, uint offset) {
+    const uint pin = 22;
+    pio_sm_config c = line_sync_program_get_default_config(offset);
+    sm_config_set_set_pins(&c, pin, 1);
+    pio_gpio_init(pio, pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_pins_with_mask(pio, sm, 0, 1u << pin);
+}
+%}

@@ -3,11 +3,15 @@
 #include "pico/stdlib.h"
 #include "hardware/pio.h"
 #include "hardware/dma.h"
+#include "hardware/irq.h"
+#include "hardware/sync.h"
+#include "hardware/structs/xip_ctrl.h"
 // Our assembled programs:
 // Each gets the name <pio_filename.pio.h>
 #include "hsync.pio.h"
 #include "vsync.pio.h"
-#include "rgb.pio.h"
+#include "rgb4.pio.h"
+#include "line_sync.pio.h"
 // Header file
 #include "vga16_graphics_v3.h"
 // Font files
@@ -69,11 +73,10 @@ DrawPixel is faster
 // VGA timing constants
 #define H_ACTIVE   655    // (active + frontporch - 1) - one cycle delay for mov
 #define V_ACTIVE   479    // (active - 1)
-#define RGB_ACTIVE 319    // (horizontal active)/2 - 1
-// #define RGB_ACTIVE 639 // change to this if 1 pixel/byte
+#define RGB_ACTIVE 639    // 640 palette pixels per visible scanline
 
 // Length of the pixel array, and number of DMA transfers
-#define VGA_BUFFER_COUNT 153600 // Total pixels/2 (since we have 2 pixels per byte)
+#define VGA_BUFFER_COUNT VGA_FRAME_BYTES // four palette indices per byte
 
 // ===============================
 // !!!=========================!!!
@@ -91,18 +94,18 @@ DrawPixel is faster
 // Pixel color array that is DMAed to the PIO machines and
 // a pointer to the ADDRESS of this color array.
 // Note that this array is automatically initialized to all 0's (black)
-unsigned char vga_buffer_0[VGA_BUFFER_COUNT];
+unsigned char vga_buffer_0[VGA_BUFFER_COUNT] __attribute__((aligned(4)));
 char * pointer_vga_buffer_0 = &vga_buffer_0[0] ;
 //
 // only define second buffer if necessary
 #ifndef DOUBLE_BUFFER_NONE
-  unsigned char vga_buffer_1[VGA_BUFFER_COUNT];
+  unsigned char vga_buffer_1[VGA_BUFFER_COUNT] __attribute__((aligned(4)));
   char * pointer_vga_buffer_1 = &vga_buffer_1[0] ;
 #endif
 //
 // the actual pointer taken from a table defined below
 // and loaded by a DMA channel
-char * current_draw_buffer ;
+char * volatile current_draw_buffer ;
 char * pointer_current_display_buffer ;
 
 // define the buffer order arrays to be cycled thru by DMA
@@ -112,7 +115,7 @@ char * pointer_display_buffer[4] __attribute__ ((aligned (16)));
 int    start_flag_array[4] __attribute__ ((aligned (16)));
 
 // DMA sets this when it is time to draw
-int start_flag = 0 ;
+volatile int start_flag = 0 ;
 // used to signal buffer type to thread
 int buffer_type ;
 
@@ -138,6 +141,149 @@ char textcolor, textbgcolor, wrap;
 #define _width 640
 #define _height 480
 
+// Optional flash-background pipeline. Scanout never waits for restoration:
+// frame IRQ -> display-pointer DMA -> draw-pointer DMA -> dispatch DMA
+//                                              +-> RGB DMA (next scanout)
+//                                              +-> background DMA -> start flag
+// The IRQ only selects buffers/rearms registers. Pixel transfers stay in DMA.
+static const void *background_image;
+static int bg_rgb_chan, bg_disp_chan, bg_draw_chan, bg_dispatch_chan;
+static int bg_copy_chan, bg_signal_chan;
+static char *bg_front, *bg_back;
+static uint32_t bg_dispatch_mask;
+static uint32_t bg_start_value = 1; // DMA source in RAM
+static volatile bool bg_frame_ready;
+static bool bg_frame_pending;
+// Watch in debugger: repeat count is expected under load; stalls should stay 0.
+volatile uint32_t vga_repeated_frames;
+volatile uint32_t vga_rgb_stall_count;
+
+static void __not_in_flash_func(background_frame_irq)(void)
+{
+    const uint32_t channel_mask = 1u << bg_rgb_chan;
+    if (!(dma_hw->ints1 & channel_mask)) return;
+    dma_hw->ints1 = channel_mask;
+
+    const uint32_t stall_mask = 1u << (PIO_FDEBUG_TXSTALL_LSB + 0);
+    static bool sampled;
+    if (sampled && (pio1->fdebug & stall_mask)) ++vga_rgb_stall_count;
+    pio1->fdebug = stall_mask;
+    sampled = true;
+
+    if (bg_frame_ready) {
+        __dmb();
+        char *old_front = bg_front;
+        bg_front = bg_back;
+        bg_back = old_front;
+        bg_frame_ready = false;
+        bg_frame_pending = false;
+    }
+
+    bg_dispatch_mask = channel_mask;
+    if (!bg_frame_pending) {
+        bg_frame_pending = true;
+        dma_channel_set_write_addr(bg_copy_chan, bg_back, false);
+        dma_channel_set_trans_count(bg_copy_chan, VGA_BUFFER_COUNT >> 2, false);
+        // XIP_AUX + DREQ_XIP_STREAM avoids direct-flash reads blocking the
+        // DMA read bus used by RGB. Streaming runs in flash idle cycles.
+        xip_ctrl_hw->stream_addr = (uintptr_t)background_image;
+        xip_ctrl_hw->stream_ctr = VGA_BUFFER_COUNT >> 2;
+        bg_dispatch_mask |= 1u << bg_copy_chan;
+    } else {
+        // CPU/copy still owns the back buffer. Display the old frame again.
+        ++vga_repeated_frames;
+    }
+    __dmb();
+    dma_start_channel_mask(1u << bg_disp_chan);
+}
+
+static int init_background_pipeline(PIO pio, uint rgb_sm)
+{
+#if !defined(DOUBLE_BUFFER_60)
+    panic("Flash background requires DOUBLE_BUFFER_60");
+#else
+    hard_assert(background_image && !((uintptr_t)background_image & 3u));
+    bg_front = (char *)vga_buffer_0;
+    bg_back = (char *)vga_buffer_1;
+    current_draw_buffer = bg_back;
+    // One startup copy gives scanout a valid static frame before rendering starts.
+    memcpy(bg_front, background_image, VGA_BUFFER_COUNT);
+    xip_ctrl_hw->stream_ctr = 0;
+    while (!(xip_ctrl_hw->stat & XIP_STAT_FIFO_EMPTY)) {
+        (void)*(volatile uint32_t *)XIP_AUX_BASE;
+    }
+
+    bg_rgb_chan = dma_claim_unused_channel(true);
+    bg_disp_chan = dma_claim_unused_channel(true);
+    bg_draw_chan = dma_claim_unused_channel(true);
+    bg_dispatch_chan = dma_claim_unused_channel(true);
+    bg_copy_chan = dma_claim_unused_channel(true);
+    bg_signal_chan = dma_claim_unused_channel(true);
+
+    dma_channel_config config = dma_channel_get_default_config(bg_rgb_chan);
+    channel_config_set_transfer_data_size(&config, DMA_SIZE_32);
+    channel_config_set_read_increment(&config, true);
+    channel_config_set_write_increment(&config, false);
+    channel_config_set_dreq(&config, pio_get_dreq(pio, rgb_sm, true));
+    channel_config_set_high_priority(&config, true);
+    // The frame IRQ selects the next buffers before starting the control chain.
+    channel_config_set_chain_to(&config, bg_rgb_chan);
+    dma_channel_configure(bg_rgb_chan, &config, &pio->txf[rgb_sm], bg_front,
+                          VGA_BUFFER_COUNT >> 2, false);
+
+    config = dma_channel_get_default_config(bg_disp_chan);
+    channel_config_set_transfer_data_size(&config, DMA_SIZE_32);
+    channel_config_set_read_increment(&config, false);
+    channel_config_set_write_increment(&config, false);
+    channel_config_set_high_priority(&config, true);
+    channel_config_set_chain_to(&config, bg_draw_chan);
+    dma_channel_configure(bg_disp_chan, &config, &dma_hw->ch[bg_rgb_chan].read_addr,
+                          &bg_front, 1, false);
+    channel_config_set_chain_to(&config, bg_dispatch_chan);
+    dma_channel_configure(bg_draw_chan, &config, &current_draw_buffer,
+                          &bg_back, 1, false);
+    channel_config_set_chain_to(&config, bg_dispatch_chan); // no chain after fork
+    dma_channel_configure(bg_dispatch_chan, &config, &dma_hw->multi_channel_trigger,
+                          &bg_dispatch_mask, 1, false);
+
+    config = dma_channel_get_default_config(bg_copy_chan);
+    channel_config_set_transfer_data_size(&config, DMA_SIZE_32);
+    channel_config_set_read_increment(&config, false); // fixed streaming FIFO
+    channel_config_set_write_increment(&config, true);
+    channel_config_set_dreq(&config, DREQ_XIP_STREAM);
+    channel_config_set_high_priority(&config, false);
+    channel_config_set_chain_to(&config, bg_signal_chan);
+    dma_channel_configure(bg_copy_chan, &config, bg_back,
+                          (const void *)XIP_AUX_BASE, VGA_BUFFER_COUNT >> 2, false);
+
+    config = dma_channel_get_default_config(bg_signal_chan);
+    channel_config_set_transfer_data_size(&config, DMA_SIZE_32);
+    channel_config_set_read_increment(&config, false);
+    channel_config_set_write_increment(&config, false);
+    channel_config_set_chain_to(&config, bg_signal_chan);
+    dma_channel_configure(bg_signal_chan, &config, &start_flag,
+                          &bg_start_value, 1, false);
+    irq_set_exclusive_handler(DMA_IRQ_1, background_frame_irq);
+    dma_channel_set_irq1_enabled(bg_rgb_chan, true);
+    irq_set_enabled(DMA_IRQ_1, true);
+    return bg_rgb_chan;
+#endif
+}
+
+void vga_frame_done(void)
+{
+    if (background_image) {
+        __dmb(); // Finish framebuffer writes before publishing to the IRQ.
+        bg_frame_ready = true;
+    }
+}
+
+void initVGAWithBackground(const void *image)
+{
+    background_image = image;
+    initVGA();
+}
+
 void initVGA() {
     // Choose which PIO instance to use (there are two instances, each with 4 state machines)
     PIO pio = pio0;
@@ -154,16 +300,20 @@ void initVGA() {
     // and is of the form <program name_program>
     uint hsync_offset = pio_add_program(pio, &hsync_program);
     uint vsync_offset = pio_add_program(pio, &vsync_program);
-    uint rgb_offset = pio_add_program(pio, &rgb_program);
+    uint line_offset = pio_add_program(pio, &line_sync_program);
+    PIO rgb_pio = pio1;
+    uint rgb_offset = pio_add_program(rgb_pio, &rgb4_program);
 
     // Manually select a few state machines from pio instance pio0.
     // void pio_sm_claim (PIO pio, uint sm)
     uint hsync_sm = 0;
     uint vsync_sm = 1;
-    uint rgb_sm = 2;
+    uint line_sm = 2;
+    uint rgb_sm = 0;
     pio_sm_claim (pio, hsync_sm);
     pio_sm_claim (pio, vsync_sm);
-    pio_sm_claim (pio, rgb_sm);
+    pio_sm_claim (pio, line_sm);
+    pio_sm_claim(rgb_pio, rgb_sm);
 
     // Call the initialization functions that are defined within each PIO file.
     // Why not create these programs here? By putting the initialization function in
@@ -171,7 +321,8 @@ void initVGA() {
     // is consolidated in one place. Here in the C, we then just import and use it.
     hsync_program_init(pio, hsync_sm, hsync_offset, HSYNC);
     vsync_program_init(pio, vsync_sm, vsync_offset, VSYNC);
-    rgb_program_init(pio, rgb_sm, rgb_offset, LO_GRN);
+    line_sync_program_init(pio, line_sm, line_offset);
+    rgb4_program_init(rgb_pio, rgb_sm, rgb_offset, LO_GRN);
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////
     // ============================== PIO DMA Channels =================================================
@@ -241,29 +392,33 @@ void initVGA() {
     // disp_chan sets the current display buffer
     // draw_chan sets the current drawing buffer
     // start_chan signals the draw thread to start drawing
-    int rgb_data_chan = dma_claim_unused_channel(true); //data
+    int rgb_data_chan;
+    if (background_image) {
+        rgb_data_chan = init_background_pipeline(rgb_pio, rgb_sm);
+    } else {
+    rgb_data_chan = dma_claim_unused_channel(true); //data
     int set_disp_chan = dma_claim_unused_channel(true); // reset pointer to current displqy
     int set_draw_chan = dma_claim_unused_channel(true); // 
     int set_start_chan = dma_claim_unused_channel(true); // 
 
-    // change this to true of other DMA channels interfer with video
-    #define rgb_high_priority false
+    // Scanout outranks bulk memory transfers.
+    #define rgb_high_priority true
 
     // data_chan (sends color data to PIO VGA machine)
     dma_channel_config c0 = dma_channel_get_default_config(rgb_data_chan);  // default configs
-    channel_config_set_transfer_data_size(&c0, DMA_SIZE_8);              // 8-bit txfers
+    channel_config_set_transfer_data_size(&c0, DMA_SIZE_32);              // 32-bit packed pixel words
     channel_config_set_read_increment(&c0, true);                        // yes read incrementing
     channel_config_set_write_increment(&c0, false);                      // no write incrementing
-    channel_config_set_dreq(&c0, DREQ_PIO0_TX2) ;                        // DREQ_PIO0_TX2 pacing (FIFO)
+    channel_config_set_dreq(&c0, DREQ_PIO1_TX0) ;                        // DREQ_PIO1_TX0 pacing (FIFO)
     channel_config_set_chain_to(&c0, set_disp_chan);                        // chain to other channel
     channel_config_set_high_priority (&c0, rgb_high_priority) ;
 
     dma_channel_configure(
         rgb_data_chan,                 // Channel to be configured
         &c0,                        // The configuration we just created
-        &pio->txf[rgb_sm],          // write address (RGB PIO TX FIFO)
+        &rgb_pio->txf[rgb_sm],          // write address (RGB PIO TX FIFO)
         &vga_buffer_0,            // The initial read address (pixel color array)
-        VGA_BUFFER_COUNT,           // Number of transfers; in this case each is 1 byte.
+        VGA_BUFFER_COUNT >> 2,      // 16 pixels per word.
         false                       // Don't start immediately.
     );
 
@@ -324,19 +479,20 @@ void initVGA() {
     /////////////////////////////////////////////////////////////////////////////////////////////////////
     /////////////////////////////////////////////////////////////////////////////////////////////////////
 
+    } // Original automatic-swap pipeline when no background is supplied.
+
     // Initialize PIO state machine counters. This passes the information to the state machines
     // that they retrieve in the first 'pull' instructions, before the .wrap_target directive
     // in the assembly. Each uses these values to initialize some counting registers.
     pio_sm_put_blocking(pio, hsync_sm, H_ACTIVE);
     pio_sm_put_blocking(pio, vsync_sm, V_ACTIVE);
-    pio_sm_put_blocking(pio, rgb_sm, RGB_ACTIVE);
+    pio_sm_put_blocking(rgb_pio, rgb_sm, RGB_ACTIVE);
 
 
     // Start the two pio machine IN SYNC
-    // Note that the RGB state machine is running at full speed,
-    // so synchronization doesn't matter for that one. But, we'll
-    // start them all simultaneously anyway.
-    pio_enable_sm_mask_in_sync(pio, ((1u << hsync_sm) | (1u << vsync_sm) | (1u << rgb_sm)));
+    // RGB on PIO1 waits for GPIO22 pulses from PIO0. Arm it first.
+    pio_sm_set_enabled(rgb_pio, rgb_sm, true);
+    pio_enable_sm_mask_in_sync(pio, ((1u << hsync_sm) | (1u << vsync_sm) | (1u << line_sm)));
 
     // Start DMA channel 0. Once started, the contents of the pixel color array
     // will be continously DMA's to the PIO machines that are driving the screen.
@@ -354,28 +510,18 @@ void initVGA() {
 // a DMA channel, we only need to modify the contents of the array and the
 // pixels will be automatically updated on the screen.
 void drawPixel(short x, short y, char color) {
-    // Range checks (640x480 display)
-    if((x > 639) | (x < 0) | (y > 479) | (y < 0) ) return;
-
-    // Which pixel is it?
-    // shift by one to get the byte (two pixels/byte)
-    //int pixel = (640 * y + x) >> 1;
-    char * draw_loc = (current_draw_buffer + ((640 * y + x) >> 1)) ;
-    // Is this pixel stored in the first 4 bits
-    // of the vga data array index, or the second
-    // 4 bits? Check, then mask.
-    // draws to the current_draw_buffer
-    if (x & 1) {
-        *(draw_loc) = (*(draw_loc) & TOPMASK) | (color << 4) ;
-    }
-    else {
-        *(draw_loc) = (*(draw_loc) & BOTTOMMASK) | (color) ;
-    }
+    if ((unsigned)x >= 640 || (unsigned)y >= 480) return;
+    uint8_t *dest = (uint8_t *)current_draw_buffer + VGA_ROW_BYTES * y + (x >> 2);
+    unsigned shift = (x & 3) << 1;
+    *dest = (*dest & ~(3u << shift)) | (vga_color_index(color) << shift);
+}
+static inline void draw_color_pair(int x, int y, unsigned char pair) {
+    drawPixel(x, y, pair & 15);
+    drawPixel(x + 1, y, pair >> 4);
 }
 
 // Check status of neighbors
 int checkNeighbors(short x, short y) {
-    char * draw_loc = (current_draw_buffer + ((640 * y + x) >> 1)) ;
 
     return (isAlive(x-1, y-1) + isAlive(x, y-1) + isAlive(x+1, y-1) +
             isAlive(x-1, y) + isAlive(x+1, y) +
@@ -408,32 +554,17 @@ void drawVLine(short x, short y, short h, char color) {
 // note that this function draws using drawPiexl AND
 // directly hitting the buffer memory for speed
 void drawHLine(int x, int y, int w, char color) {
-  // range checks
-  if((x >= _width) || (y >= _height)) return;
-  if((x + w - 1) >= _width)  w = _width  - x - 1;
-  if(w<1) return ;
-  //
-  if(w == 1){
-    drawPixel(x,y,color);
-    return ;
-  }
-  //
-  short both_color = color | (color<<4) ;
-  // loner pixel at x -- align left with next byte boundary
-  if((x & 1)) {
-    drawPixel(x,y,color);
-    x++ ;
-    w-- ;
-  }
-  // draw loner pixel at end and adjust width
-  if((w & 1)){
-    drawPixel(x+w-1, y, color);
-    w-- ;
-  }
-  // draw rest of line
-  int len = (w>>1)  ;
-  if (len>0  )  //&& len+x < 640 && y<480
-    memset(current_draw_buffer+(320*y+(x>>1)), both_color, len) ;
+    if ((unsigned)y >= 480 || w <= 0 || x >= 640) return;
+    if (x < 0) { w += x; x = 0; }
+    if (w > 640 - x) w = 640 - x;
+    if (w <= 0) return;
+    while ((x & 3) && w) { drawPixel(x++, y, color); --w; }
+    int bytes = w >> 2;
+    memset(current_draw_buffer + VGA_ROW_BYTES * y + (x >> 2),
+           vga_color_index(color) * 0x55u, bytes);
+    x += bytes << 2;
+    w &= 3;
+    while (w--) drawPixel(x++, y, color);
 }
 
 // general line drawing
@@ -1048,7 +1179,6 @@ int drawTextGLCD(short x, short y, char * str, char color, char bgcolor){
   char col[5];
   int char_count = 0 ;
   // get string start
-  char * draw_loc = (current_draw_buffer + ((640 * y + x) >> 1)) ;
   // error check
   if(x<0 | y<0 | y>470 ) return 0;
   // set up the possible values for any byte
@@ -1066,11 +1196,10 @@ int drawTextGLCD(short x, short y, char * str, char color, char bgcolor){
       // each two pixels is one byte, so write 3 bytes
       // using the value of 'col' to index into the pixel table
       // then do a lot of bit shffling to transpose the character
-        *(draw_loc+i*320) =   pix_value[(((col[0]>>i)&0x01)<<1) | (((col[1]>>i)&0x01))] ;
-        *(draw_loc+i*320+1) = pix_value[(((col[2]>>i)&0x01)<<1) | (((col[3]>>i)&0x01))] ;
-        *(draw_loc+i*320+2) = pix_value[(((col[4]>>i)&0x01)<<1) ] ;   
+        draw_color_pair(x + 0, y + i, pix_value[(((col[0]>>i)&0x01)<<1) | (((col[1]>>i)&0x01))]);
+        draw_color_pair(x + 2, y + i, pix_value[(((col[2]>>i)&0x01)<<1) | (((col[3]>>i)&0x01))]);
+        draw_color_pair(x + 4, y + i, pix_value[(((col[4]>>i)&0x01)<<1) ]);
     }
-    draw_loc += 3 ;
     x += 6 ;
   }     
   return char_count ;  
@@ -1082,7 +1211,6 @@ int drawTextGLCD(short x, short y, char * str, char color, char bgcolor){
 int drawTextAscii(short x, short y, char * str, char color, char bgcolor){
   // get string start
   int char_count = 0 ;
-  char * draw_loc = (current_draw_buffer + ((640 * y + x) >> 1)) ;
   // error check
   if(x<0 | y<0 | y>470) return 0;
   // set up the possible values for any byte
@@ -1099,12 +1227,10 @@ int drawTextAscii(short x, short y, char * str, char color, char bgcolor){
       line = pgm_read_byte(asciifont+((int)c*7)+i);
       // each two pixels is one byte, so write 4 bytes
       // using the value of 'line' to index into the pixel table//
-        *(draw_loc+i*320) =   pix_value[(line>>6) & 0x03] ;
-        *(draw_loc+i*320+1) = pix_value[(line>>4) & 0x03] ; //draw_loc+i*320
-        *(draw_loc+i*320+2) = pix_value[(line>>2) & 0x03] ;
-        //*(draw_loc+i*320+3) = pix_value[(line) & 0x03] ;     
+        draw_color_pair(x + 0, y + i, pix_value[(line>>6) & 0x03]);
+        draw_color_pair(x + 2, y + i, pix_value[(line>>4) & 0x03]);
+        draw_color_pair(x + 4, y + i, pix_value[(line>>2) & 0x03]);
     }
-    draw_loc += 3 ;
     x += 6 ;
   }
   return char_count ;
@@ -1116,7 +1242,6 @@ int drawTextAscii(short x, short y, char * str, char color, char bgcolor){
 int drawTextTiny8(short x, short y, char * str, char color, char bgcolor){
   // get string start
   int char_count = 0 ;
-  char * draw_loc = (current_draw_buffer + ((640 * y + x) >> 1)) ;
   // error check
   if(x<0 | y<0 | y>470) return 0;
   // set up the possible values for any byte
@@ -1133,12 +1258,11 @@ int drawTextTiny8(short x, short y, char * str, char color, char bgcolor){
       line = pgm_read_byte(TinyFont+((int)c*8)+i);
       // each two pixels is one byte, so write 4 bytes
       // using the value of 'line' to index into the pixel table//
-        *(draw_loc+i*320) =   pix_value[(line>>6) & 0x03] ;
-        *(draw_loc+i*320+1) = pix_value[(line>>4) & 0x03] ; //draw_loc+i*320
-        *(draw_loc+i*320+2) = pix_value[(line>>2) & 0x03] ;
-        *(draw_loc+i*320+3) = pix_value[(line) & 0x03] ;     
+        draw_color_pair(x + 0, y + i, pix_value[(line>>6) & 0x03]);
+        draw_color_pair(x + 2, y + i, pix_value[(line>>4) & 0x03]);
+        draw_color_pair(x + 4, y + i, pix_value[(line>>2) & 0x03]);
+        draw_color_pair(x + 6, y + i, pix_value[(line) & 0x03]);
     }
-    draw_loc += 4 ;
     x += 8 ;
   }
   return char_count ;
@@ -1148,7 +1272,6 @@ int drawTextTiny8(short x, short y, char * str, char color, char bgcolor){
 int drawTextVGA437(short x, short y, char * str, char color, char bgcolor){
   int char_count = 0 ;
   // get string start
-  char * draw_loc = (current_draw_buffer + ((640 * y + x) >> 1)) ;
   // error check
   if(x<0 | y<0 | x>630 | y>463) return 0;
   // set up the possible values for any byte
@@ -1164,12 +1287,11 @@ int drawTextVGA437(short x, short y, char * str, char color, char bgcolor){
       line = pgm_read_byte(bigFont+((int)c*16)+i);
       // each two pixels is one byte, so write 4 bytes
       // using the value of 'line' to index into the pixel table//
-        *(draw_loc+i*320) =   pix_value[(line>>6) & 0x03] ;
-        *(draw_loc+i*320+1) = pix_value[(line>>4) & 0x03] ; //draw_loc+i*320
-        *(draw_loc+i*320+2) = pix_value[(line>>2) & 0x03] ;
-        *(draw_loc+i*320+3) = pix_value[(line) & 0x03] ;     
+        draw_color_pair(x + 0, y + i, pix_value[(line>>6) & 0x03]);
+        draw_color_pair(x + 2, y + i, pix_value[(line>>4) & 0x03]);
+        draw_color_pair(x + 4, y + i, pix_value[(line>>2) & 0x03]);
+        draw_color_pair(x + 6, y + i, pix_value[(line) & 0x03]);
     }
-    draw_loc += 4 ;
     x += 8 ;
   }
   return char_count ;
@@ -1181,7 +1303,6 @@ int drawTextVGA437(short x, short y, char * str, char color, char bgcolor){
 int drawTextArial24(short x, short y, char * str, char color, char bgcolor){
   int char_count = 0 ;
   // get string start
-  char * draw_loc = (current_draw_buffer + ((640 * y + x) >> 1)) ;
   // error check
   if(x<0 | y<0 | y>455 ) return 0;
   // set up the possible values for any byte
@@ -1198,19 +1319,18 @@ int drawTextArial24(short x, short y, char * str, char color, char bgcolor){
       line = pgm_read_byte(Arial_round_16x24+((int)c*48)+2*i);
       // each two pixels is one byte, so write 4 bytes
       // using the value of 'line' to index into the pixel table//
-        *(draw_loc+i*320) =   pix_value[(line>>6) & 0x03] ;
-        *(draw_loc+i*320+1) = pix_value[(line>>4) & 0x03] ; //draw_loc+i*320
-        *(draw_loc+i*320+2) = pix_value[(line>>2) & 0x03] ;
-        *(draw_loc+i*320+3) = pix_value[(line) & 0x03] ;  
+        draw_color_pair(x + 0, y + i, pix_value[(line>>6) & 0x03]);
+        draw_color_pair(x + 2, y + i, pix_value[(line>>4) & 0x03]);
+        draw_color_pair(x + 4, y + i, pix_value[(line>>2) & 0x03]);
+        draw_color_pair(x + 6, y + i, pix_value[(line) & 0x03]);
       line = pgm_read_byte(Arial_round_16x24+((int)c*48)+2*i+1);
       // each two pixels is one byte, so write 4 bytes
       // using the value of 'line' to index into the pixel table//
-        *(draw_loc+i*320+4) = pix_value[(line>>6) & 0x03] ;
-        *(draw_loc+i*320+5) = pix_value[(line>>4) & 0x03] ; //draw_loc+i*320
-        *(draw_loc+i*320+6) = pix_value[(line>>2) & 0x03] ;
-        *(draw_loc+i*320+7) = pix_value[(line) & 0x03] ;     
+        draw_color_pair(x + 8, y + i, pix_value[(line>>6) & 0x03]);
+        draw_color_pair(x + 10, y + i, pix_value[(line>>4) & 0x03]);
+        draw_color_pair(x + 12, y + i, pix_value[(line>>2) & 0x03]);
+        draw_color_pair(x + 14, y + i, pix_value[(line) & 0x03]);
     }
-    draw_loc += 8 ;
     x += 16 ;
   }
   return char_count ;
@@ -1220,7 +1340,6 @@ int drawTextArial24(short x, short y, char * str, char color, char bgcolor){
 int drawTextGrotesk32(short x, short y, char * str, char color, char bgcolor){
   int char_count = 0 ;
   // get string start
-  char * draw_loc = (current_draw_buffer + ((640 * y + x) >> 1)) ;
   // error check
   if(x<0 | y<0 | y>479-32 ) return 0 ; //(x+16*strlen(str)>639)
   // set up the possible values for any byte
@@ -1237,19 +1356,18 @@ int drawTextGrotesk32(short x, short y, char * str, char color, char bgcolor){
       line = pgm_read_byte(Grotesk16x32+((int)c*64)+2*i);
       // each two pixels is one byte, so write 4 bytes
       // using the value of 'line' to index into the pixel table//
-        *(draw_loc+i*320) =   pix_value[(line>>6) & 0x03] ;
-        *(draw_loc+i*320+1) = pix_value[(line>>4) & 0x03] ; //draw_loc+i*320
-        *(draw_loc+i*320+2) = pix_value[(line>>2) & 0x03] ;
-        *(draw_loc+i*320+3) = pix_value[(line) & 0x03] ;  
+        draw_color_pair(x + 0, y + i, pix_value[(line>>6) & 0x03]);
+        draw_color_pair(x + 2, y + i, pix_value[(line>>4) & 0x03]);
+        draw_color_pair(x + 4, y + i, pix_value[(line>>2) & 0x03]);
+        draw_color_pair(x + 6, y + i, pix_value[(line) & 0x03]);
       line = pgm_read_byte(Grotesk16x32+((int)c*64)+2*i+1);
       // each two pixels is one byte, so write 4 bytes
       // using the value of 'line' to index into the pixel table//
-        *(draw_loc+i*320+4) = pix_value[(line>>6) & 0x03] ;
-        *(draw_loc+i*320+5) = pix_value[(line>>4) & 0x03] ; //draw_loc+i*320
-        *(draw_loc+i*320+6) = pix_value[(line>>2) & 0x03] ;
-        *(draw_loc+i*320+7) = pix_value[(line) & 0x03] ;     
+        draw_color_pair(x + 8, y + i, pix_value[(line>>6) & 0x03]);
+        draw_color_pair(x + 10, y + i, pix_value[(line>>4) & 0x03]);
+        draw_color_pair(x + 12, y + i, pix_value[(line>>2) & 0x03]);
+        draw_color_pair(x + 14, y + i, pix_value[(line) & 0x03]);
     }
-    draw_loc += 8 ;
     x +=16 ;
   }
   return char_count ;
@@ -1275,20 +1393,22 @@ void drawBoldTextGLCD(short x, short y, char * str, char textcolor, char textbgc
 // They will clobber memory if x,y falls outside
 // the vga display boundaries (0,0) to (640,480)
 void clearRect(short x1, short y1, short x2, short y2, short c) {
-  for(int i=y1; i<y2; i++){
-    memset(current_draw_buffer+320*i+(x1>>1), c | (c<<4), (x2-x1)>>1) ;
-  };
+    for (int y = y1; y < y2; ++y) drawHLine(x1, y, x2 - x1, c);
 }
-//
 void clearLowFrame(short top, short c) {
-    memset((current_draw_buffer+320*top), c | (c<<4), (VGA_BUFFER_COUNT-320*top) );
+    if (top < 0) top = 0;
+    if (top >= 480) return;
+    memset(current_draw_buffer + VGA_ROW_BYTES * top,
+           vga_color_index(c) * 0x55u, VGA_BUFFER_COUNT - VGA_ROW_BYTES * top);
 }
-// region from y1 to y2 with y1 < y2
 void clearRegion(short y1, short y2, short c) {
-  memset((current_draw_buffer+320*y1), c | (c<<4), (320*(y2-y1)) );
+    if (y1 < 0) y1 = 0;
+    if (y2 > 480) y2 = 480;
+    if (y2 <= y1) return;
+    memset(current_draw_buffer + VGA_ROW_BYTES * y1,
+           vga_color_index(c) * 0x55u, VGA_ROW_BYTES * (y2 - y1));
 }
 
-// ======================================
 // buffer copy utilities
 #ifndef DOUBLE_BUFFER_NONE
   void copy_buffer0to1(void){
@@ -1330,19 +1450,10 @@ int get_buffer_type(void){
 // get the color of a pixel
 // but remember there are two buffers!
 short readPixel(short x, short y) {
-  // Which pixel is it?
-  int pixel = ((640 * y) + x)>>1 ;
-  short color ;
-  // Is this pixel stored in the first 4 bits
-  // of the vga data array index, or the second
-  // 4 bits? Check, then mask.
-  if (x & 1) {
-      color = *(current_draw_buffer+pixel) >> 4 ;
-  }
-  else {
-      color = *(current_draw_buffer+pixel)& 0xf  ;
-  }
-  return color ;
+    static const unsigned char palette[4] = {BLACK, MAGENTA, CYAN, WHITE};
+    if ((unsigned)x >= 640 || (unsigned)y >= 480) return BLACK;
+    unsigned char value = ((unsigned char *)current_draw_buffer)[VGA_ROW_BYTES * y + (x >> 2)];
+    return palette[(value >> ((x & 3) << 1)) & 3];
 }
   
 ///////////////////////////////////////////////
