@@ -49,6 +49,7 @@ typedef signed int fix15 ;
 
 // ball-related constants
 #define BALL_SPAWN_Y 20
+#define BALL_SPAWN_X_JITTER 1.0f // maximum horizontal spawn offset, in pixels
 // Respawn once the ball center clears the bottom row's collision region.
 #define BALL_EXIT_Y (FIRST_PEG_Y + (PEG_ROWS - 1) * PEG_VERTICAL_SPACING + PEG_RADIUS + BALL_RADIUS + 1)
 
@@ -558,11 +559,22 @@ void drawPegs(void)
 // create a ball
 void spawnBall(Ball *ball)
 {
-  ball->x = store_position(spawn_x);
+  // Independent small position offset for both initial drops and respawns.
+  fix15 spawn_offset = float2fix15(BALL_SPAWN_X_JITTER *
+      (2.0f * ((float)rand() * random_reciprocal) - 1.0f));
+  ball->x = store_position(spawn_x + spawn_offset);
   ball->y = store_position(spawn_y);
   // Small randomized horizontal velocity, approximately -0.125 to +0.125.
-  ball->vx = store_velocity(float2fix15(
-      0.25f * ((float)rand() * random_reciprocal) - 0.125f));
+  // Q5 positions discard motion below half a position unit each update.
+  // Keep at least one unit of sideways motion to avoid dropping exactly onto
+  // the first peg's center and remaining in a vertical bouncing orbit.
+  fix15 initial_vx = float2fix15(
+      0.25f * ((float)rand() * random_reciprocal) - 0.125f);
+  const fix15 minimum_spawn_vx = 1 << (15 - 5); // 1/32 pixel per frame
+  if (absfix15(initial_vx) < minimum_spawn_vx) {
+    initial_vx = initial_vx < 0 ? -minimum_spawn_vx : minimum_spawn_vx;
+  }
+  ball->vx = store_velocity(initial_vx);
   ball->vy = 0;
 }
 

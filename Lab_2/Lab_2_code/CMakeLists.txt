@@ -40,8 +40,7 @@ pico_generate_pio_header(VGA_Animation_Demo ${CMAKE_CURRENT_LIST_DIR}/VGA/line_s
 # must match with executable name and source file names
 target_sources(VGA_Animation_Demo PRIVATE   #rotary_encoder_and_vga.c
                                             # galton_16_peg.c
-                                            #galton_16_peg_opt.c
-                                            galton_16_peg_opt_kaelem.c
+                                            galton_16_peg_opt.c
                                             VGA/vga16_graphics_v3.c)
 
 # Pre-render the background into flash, regenerating with geometry/font changes.
@@ -50,10 +49,10 @@ set(GALTON_BACKGROUND ${CMAKE_CURRENT_BINARY_DIR}/galton_background.h)
 add_custom_command(OUTPUT ${GALTON_BACKGROUND}
     COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_LIST_DIR}/tools/generate_galton_background.py
-        ${CMAKE_CURRENT_LIST_DIR}/galton_16_peg_opt_kaelem.c
+        ${CMAKE_CURRENT_LIST_DIR}/galton_16_peg_opt.c
         ${CMAKE_CURRENT_LIST_DIR}/VGA/font_glcd.c
         ${GALTON_BACKGROUND}
-    DEPENDS tools/generate_galton_background.py galton_16_peg_opt_kaelem.c VGA/font_glcd.c
+    DEPENDS tools/generate_galton_background.py galton_16_peg_opt.c VGA/font_glcd.c
     VERBATIM)
 target_sources(VGA_Animation_Demo PRIVATE ${GALTON_BACKGROUND})
 target_include_directories(VGA_Animation_Demo PRIVATE ${CMAKE_CURRENT_BINARY_DIR})

@@ -72,7 +72,7 @@ def check_pio():
             if pc != 7:
                 assert (inst & 31) == palette[expected[len(output)]]
                 if last_pixel_cycle is not None:
-                    assert cycles - last_pixel_cycle == 10
+                    assert cycles - last_pixel_cycle == 12
                 last_pixel_cycle = cycles
                 output.append(inst & 31)
         else:
@@ -82,14 +82,14 @@ def check_pio():
     assert waits == 480
     assert next(fifo, None) is None
     print('PASS: assembled PIO emits 307,200 correct colors, 640 pixels per row, '
-          '10 cycles per pixel; both instruction memories fit.')
+          '12 cycles per pixel; both instruction memories fit.')
 
 
 def check_background():
     spec = importlib.util.spec_from_file_location('bg', ROOT / 'tools/generate_galton_background.py')
     bg = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(bg)
-    source = (ROOT / 'galton_16_peg_opt_kaelem.c').read_text()
+    source = (ROOT / 'galton_16_peg_opt.c').read_text()
     frame, labels = bg.generate(source, (ROOT / 'VGA/font_glcd.c').read_text())
     assert len(frame) == 76800
     get = lambda x, y: (frame[y * 160 + (x >> 2)] >> ((x & 3) * 2)) & 3

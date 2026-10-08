@@ -1,4 +1,4 @@
-; Four-color indexed scanout, 250 MHz system clock / 10 = 25 MHz pixels.
+; Four-color indexed scanout, 300 MHz system clock / 12 = 25 MHz pixels.
 ; PIO1 owns the palette decoder; OUT PC requires this table at address zero.
 .program rgb4
 .origin 0
@@ -18,16 +18,16 @@ wait 1 gpio 22 [3]            ; internal line pulse from PIO0, no external wire
 pixel:
 out pc, 2                    ; palette index 0..3; 16 pixels per FIFO word
 black:
-set pins, 0 [5]
+set pins, 0 [7]
 jmp next_pixel
 magenta:
-set pins, 12 [5]
+set pins, 12 [7]
 jmp next_pixel
 cyan:
-set pins, 7 [5]
+set pins, 7 [7]
 jmp next_pixel
 white:
-set pins, 15 [5]
+set pins, 15 [7]
 jmp next_pixel
 next_pixel:
 jmp x-- pixel
