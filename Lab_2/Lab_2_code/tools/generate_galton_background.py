@@ -20,12 +20,12 @@ def generate(source, font_source):
     font_body = font_source.split('font[] = {', 1)[1].split('}', 1)[0]
     font_body = re.sub(r'//[^\n]*|/\*.*?\*/', '', font_body, flags=re.S)
     font = bytes(int(v, 16) for v in re.findall(r'0x[0-9a-fA-F]+', font_body))
-    frame = bytearray(640 * 480 // 4)
+    frame = bytearray(640 * 480 // 8)
 
     def pixel(x, y, color):
         if 0 <= x < 640 and 0 <= y < 480:
-            index, shift = (640 * y + x) >> 2, (x & 3) * 2
-            frame[index] = (frame[index] & ~(3 << shift)) | ({0: 0, 12: 1, 7: 2, 15: 3}[color] << shift)
+            index, shift = (640 * y + x) >> 3, x & 7
+            frame[index] = (frame[index] & ~(1 << shift)) | (int(color != 0) << shift)
 
     radius = constant('PEG_RADIUS')
     for row in range(constant('PEG_ROWS')):
@@ -65,8 +65,8 @@ def main():
              '#pragma once', '#include <stdint.h>',
              'static const short background_value_x[4] = {' +
              ', '.join(str(10 + 6 * len(label)) for label in labels) + '};',
-             'static const uint32_t galton_background[19200] = {']
-    words = struct.unpack('<19200I', frame)
+             'static const uint32_t galton_background[9600] = {']
+    words = struct.unpack('<9600I', frame)
     for start in range(0, len(words), 8):
         lines.append('    ' + ', '.join(f'0x{v:08x}u' for v in words[start:start + 8]) + ',')
     lines.append('};')

@@ -2,7 +2,7 @@
  * Hunter Adams (vha3@cornell.edu)
  * modifed for 16 colors by BRL4
  * 
- * Four-color RP2350 driver; legacy filename retained.
+ * Two-color RP2350 driver; legacy filename retained.
 
  * HARDWARE CONNECTIONS
  *  - GPIO 16 ---> VGA Hsync
@@ -16,7 +16,7 @@
  * RESOURCES USED
  *  - PIO state machines 0, 1, and 2 on PIO instance 0
  *  - 4 DMA channels normally; 6 with flash background
- *  - 2 x 76.8 kBytes of RAM for double-buffered 2-bit pixels
+ *  - 2 x 38.4 kBytes of RAM for double-buffered 1-bit pixels
  *  - PIO0 SM0/1/2 for sync; PIO1 SM0 for palette decoding
  *  - GPIO22 reserved as an internal line-sync bridge (no cable needed)
  *
@@ -29,19 +29,17 @@
 // Give the I/O pins that we're using some names that make sense - usable in main()
  enum vga_pins {HSYNC=16, VSYNC, LO_GRN, HI_GRN, BLUE_PIN, RED_PIN} ;
 
-// Legacy color names. This driver supports BLACK, MAGENTA, CYAN, WHITE;
-// unsupported colors map to black.
+// Legacy color names: BLACK maps to black; all other colors map to magenta.
 enum colors {BLACK, DARK_GREEN, MED_GREEN, GREEN,
             DARK_BLUE, BLUE, LIGHT_BLUE, CYAN,
             RED, DARK_ORANGE, ORANGE, YELLOW, 
             MAGENTA, PINK, LIGHT_PINK, WHITE} ;
 
-// This driver now stores four 2-bit palette indices per byte. Public drawing
-// functions retain the legacy BLACK/MAGENTA/CYAN/WHITE color constants.
-#define VGA_FRAME_BYTES 76800
-#define VGA_ROW_BYTES 160
+// Eight 1-bit pixels per byte, leftmost pixel in the least significant bit.
+#define VGA_FRAME_BYTES 38400
+#define VGA_ROW_BYTES 80
 static inline unsigned char vga_color_index(char color) {
-    return color == WHITE ? 3 : color == CYAN ? 2 : color == MAGENTA ? 1 : 0;
+    return color != BLACK;
 }
 
 // Augmentations
@@ -53,7 +51,7 @@ int isAlive(short x, short y) ;
 // VGA init -- Do this before any other libraries
 void initVGA(void) ;
 // Flash-background mode: 6 DMA channels, exclusive XIP stream and DMA_IRQ_1.
-// image points to an aligned 76800-byte, 2-bit packed image in flash.
+// image points to an aligned 38400-byte, 1-bit packed image in flash.
 void initVGAWithBackground(const void *image);
 // Publish a completed frame, after ALL drawing threads finish.
 void vga_frame_done(void);

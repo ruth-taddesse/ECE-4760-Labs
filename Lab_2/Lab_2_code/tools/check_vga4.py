@@ -20,15 +20,15 @@ def instructions(name):
 
 
 def check_pio():
-    code = instructions('rgb4')
+    code = instructions('rgb2')
     assert len(code) <= 32
     assert sum(len(instructions(n)) for n in ('hsync', 'vsync', 'line_sync')) <= 32
     rng = random.Random(4760)
-    frame = bytes(rng.randrange(256) for _ in range(76800))
-    fifo = iter([639, *struct.unpack('<19200I', frame)])
-    expected = [((byte >> shift) & 3) for byte in frame for shift in (0, 2, 4, 6)]
-    palette = [0, 12, 7, 15]
-    pc, osr, shifted, x, y, cycles = 4, 0, 32, 0, 0, 0
+    frame = bytes(rng.randrange(256) for _ in range(38400))
+    fifo = iter([639, *struct.unpack('<9600I', frame)])
+    expected = [((byte >> shift) & 1) for byte in frame for shift in range(8)]
+    palette = [0, 12]
+    pc, osr, shifted, x, y, cycles = 2, 0, 32, 0, 0, 0
     output = []
     last_pixel_cycle = None
     waits = 0
@@ -36,7 +36,7 @@ def check_pio():
         inst = code[pc]
         opcode, delay, dest = inst >> 13, (inst >> 8) & 31, (inst >> 5) & 7
         count = (inst & 31) or 32
-        next_pc = 7 if pc == 19 else pc + 1
+        next_pc = 5 if pc == 13 else pc + 1
         if opcode == 4:  # PULL setup word
             osr, shifted = next(fifo), 0
         elif opcode == 5:  # MOV y, osr / MOV x, y
@@ -69,7 +69,7 @@ def check_pio():
             waits += 1
             last_pixel_cycle = None
         elif opcode == 7:  # SET PINS: blanking or a decoded pixel
-            if pc != 7:
+            if pc != 5:
                 assert (inst & 31) == palette[expected[len(output)]]
                 if last_pixel_cycle is not None:
                     assert cycles - last_pixel_cycle == 12
@@ -91,8 +91,8 @@ def check_background():
     spec.loader.exec_module(bg)
     source = (ROOT / 'galton_16_peg_opt.c').read_text()
     frame, labels = bg.generate(source, (ROOT / 'VGA/font_glcd.c').read_text())
-    assert len(frame) == 76800
-    get = lambda x, y: (frame[y * 160 + (x >> 2)] >> ((x & 3) * 2)) & 3
+    assert len(frame) == 38400
+    get = lambda x, y: (frame[y * 80 + (x >> 3)] >> (x & 7)) & 1
     value = lambda name: int(re.search(r'^#define\s+' + name + r'\s+(\d+)', source, re.M)[1])
     for row in range(value('PEG_ROWS')):
         for col in range(row + 1):
@@ -101,9 +101,9 @@ def check_background():
             y = value('FIRST_PEG_Y') + row * value('PEG_VERTICAL_SPACING')
             assert get(x, y) == 1
     for i, label in enumerate(labels):
-        assert any(get(x, y) == 3 for x in range(10, 10 + 6 * len(label))
+        assert any(get(x, y) == 1 for x in range(10, 10 + 6 * len(label))
                    for y in range(20 + i * 10, 28 + i * 10))
-    print('PASS: 76,800-byte background, peg palette indices and all four labels.')
+    print('PASS: 38,400-byte background, peg palette indices and all four labels.')
 
 
 if __name__ == '__main__':

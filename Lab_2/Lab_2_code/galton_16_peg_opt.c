@@ -59,13 +59,13 @@ typedef signed int fix15 ;
 #define a_pin 14
 #define b_pin 15
 
-#define MAX_BALLS 44500
-#define INITIAL_BALLS 20000
+#define MAX_BALLS 54100
+#define INITIAL_BALLS 50000
 
 // histogram location + layout constants
 #define HISTOGRAM_BASELINE 458
 #define BIN_COUNT_Y (HISTOGRAM_BASELINE + 2)
-#define HISTOGRAM_HEIGHT 90
+#define HISTOGRAM_HEIGHT 85
 #define BAR_WIDTH 20       // width of each bar in pixels
 #define BAR_SPACING PEG_HORIZONTAL_SPACING // spacing between adjacent bins matches row 16 pegs
 
@@ -74,6 +74,8 @@ typedef signed int fix15 ;
 #define PEG_RADIUS 6
 #define COLLISION_DISTANCE int2fix15(BALL_RADIUS + PEG_RADIUS)
 #define GRAVITY float2fix15(0.37)
+#define GRAVITY_1X_BALL_LIMIT 17000
+#define GRAVITY_2X_BALL_LIMIT 37500
 
 // 16-row Galton board geometry: row n contains n + 1 pegs
 #define PEG_ROWS 16
@@ -105,9 +107,6 @@ static const fix15 spawn_y = int2fix15(BALL_SPAWN_Y);
 static const fix15 exit_y = int2fix15(BALL_EXIT_Y);
 static const fix15 collision_separation = int2fix15(BALL_RADIUS + PEG_RADIUS + 1);
 static const fix15 fallback_normal_y = -int2fix15(1);
-static const fix15 gravity_position_step =
-    GRAVITY * ((PHYSICS_EVERY_N_FRAMES * (PHYSICS_EVERY_N_FRAMES - 1)) >> 1);
-static const fix15 gravity_velocity_step = GRAVITY * (PHYSICS_EVERY_N_FRAMES - 1);
 static const unsigned int physics_countdown_reset = PHYSICS_EVERY_N_FRAMES - 1;
 static const fix15 first_peg_y = int2fix15(FIRST_PEG_Y);
 static const fix15 peg_row_spacing = int2fix15(PEG_VERTICAL_SPACING);
@@ -249,6 +248,10 @@ static semaphore_t physics_done;
 static int worker_begin;
 static int worker_end;
 static fix15 frame_bounce;
+// Selected once per physics job and shared by both cores until completion.
+static fix15 frame_gravity;
+static fix15 frame_gravity_position_step;
+static fix15 frame_gravity_velocity_step;
 
 // Core 1 publishes one aggregate hit flag before signaling physics_done.
 // Core 0 keeps its own aggregate in the animation thread.
@@ -275,7 +278,7 @@ volatile int animated_balls = INITIAL_BALLS;
 volatile uint32_t total_fallen = 0;
 volatile bool state = true; // true = adjusting # of balls, false = adjusting bounciness
 volatile uint32_t bounciness = float2fix15(0.5);
-// VGA stores four 2-bit palette indices per byte, leftmost in the low bits.
+// VGA stores eight 1-bit pixels per byte, leftmost in the low bits.
 extern char * volatile current_draw_buffer;
 
 static uint16_t DAC_data[SOUND_SAMPLES];
@@ -494,7 +497,7 @@ void gpio_callback(uint gpio, uint32_t event_mask) {
 // } // animation thread
 
 // the color of the ball
-char ball_color = WHITE ;
+char ball_color = MAGENTA ;
 
 // the color of the peg
 char peg_color = MAGENTA ;
@@ -530,17 +533,17 @@ static void drawBall(int x, int y, char color) {
     if (x < 0 || x > 640 || y < 0 || y > 480) return;
     uint8_t *buffer = (uint8_t *)current_draw_buffer;
     const uint8_t pixel = vga_color_index(color);
-    const uint8_t packed = pixel * 0x55u;
+    const uint8_t packed = pixel * 0xffu;
     const int left = x > 0 ? x - 1 : 0;
     const int right = x < 640 ? x : 639;
     const int top = y > 0 ? y - 1 : 0;
     const int bottom = y < 480 ? y : 479;
-    const unsigned mask = ((1u << (2 * (right - left + 1))) - 1u)
-                          << (2 * (left & 3));
+    const unsigned mask = ((1u << (right - left + 1)) - 1u)
+                          << (left & 7);
     const uint8_t first_mask = (uint8_t)mask;
     const uint8_t second_mask = (uint8_t)(mask >> 8);
     for (int py = top; py <= bottom; ++py) {
-        uint8_t *dest = buffer + VGA_ROW_BYTES * py + (left >> 2);
+        uint8_t *dest = buffer + VGA_ROW_BYTES * py + (left >> 3);
         dest[0] = (dest[0] & ~first_mask) | (packed & first_mask);
         // A pair starting at the last pixel in a byte crosses into the next.
         if (second_mask) {
@@ -672,11 +675,11 @@ static bool updateBallPhysics(Ball *ball, fix15 bounce)
     // Advance N frames using the original position-then-gravity order.
     // Integer multiplication preserves the fixed-point scale.
     x += vx * PHYSICS_EVERY_N_FRAMES;
-    y += vy * PHYSICS_EVERY_N_FRAMES + gravity_position_step;
+    y += vy * PHYSICS_EVERY_N_FRAMES + frame_gravity_position_step;
 
     // Velocity entering the final frame's collision check.
     // The remaining gravity step is applied at the function's end.
-    vy += gravity_velocity_step;
+    vy += frame_gravity_velocity_step;
 
     // Find rows intersecting the collision box. Clamp negative coordinates
     // before using unsigned reciprocal multiplication for exact grid indices.
@@ -761,7 +764,7 @@ static bool updateBallPhysics(Ball *ball, fix15 bounce)
 collision_done:
     // Core 0 will respawn exiting balls after both cores finish.
     if (y <= exit_y) {
-        vy += GRAVITY;
+        vy += frame_gravity;
     }
 
     if (y > exit_y) {
@@ -878,7 +881,7 @@ static PT_THREAD (protothread_serial(struct pt *pt))
     serial_write ;
       while(1) {
         // print prompt
-        sprintf(pt_serial_out_buffer, "ball color: 1=white, 2=magenta, 3=cyan: ");
+        sprintf(pt_serial_out_buffer, "ball color: 1/2/3=magenta: ");
         // non-blocking write
         serial_write ;
         // spawn a thread to do the non-blocking serial read
@@ -886,9 +889,9 @@ static PT_THREAD (protothread_serial(struct pt *pt))
         // convert input string to number
         sscanf(pt_serial_in_buffer,"%d", &user_input) ;
         // update ball color
-        if (user_input == 1) ball_color = WHITE;
+        if (user_input == 1) ball_color = MAGENTA;
         else if (user_input == 2) ball_color = MAGENTA;
-        else if (user_input == 3) ball_color = CYAN;
+        else if (user_input == 3) ball_color = MAGENTA;
       } // END WHILE(1)
   PT_END(pt);
 } // timer thread
@@ -946,6 +949,12 @@ static PT_THREAD(protothread_anim(struct pt *pt))
         if (physics_countdown == 0) {
           // Publish this update's settings before waking core 1.
           frame_bounce = (fix15)bounciness;
+          const int gravity_multiplier = active_balls <= GRAVITY_1X_BALL_LIMIT ? 1 :
+              (active_balls <= GRAVITY_2X_BALL_LIMIT ? 2 : 3);
+          frame_gravity = GRAVITY * gravity_multiplier;
+          frame_gravity_position_step = frame_gravity *
+              ((PHYSICS_EVERY_N_FRAMES * (PHYSICS_EVERY_N_FRAMES - 1)) >> 1);
+          frame_gravity_velocity_step = frame_gravity * (PHYSICS_EVERY_N_FRAMES - 1);
 
           // Give core 1 more physics while core 0 also clears and renders.
           worker_begin = active_balls >> 2;

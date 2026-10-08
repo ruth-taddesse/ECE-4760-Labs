@@ -17,7 +17,7 @@ Display-pointer DMA -> Draw-pointer DMA -> Dispatch DMA
 ```
 
 Dispatch writes a channel mask to the DMA multi-channel trigger register.
-RGB restarts without waiting for the background copy. The copy reads 19,200
+RGB restarts without waiting for the background copy. The copy reads 9,600
 32-bit words from `XIP_AUX_BASE`, paced by `DREQ_XIP_STREAM`, and writes them
 to the back buffer. Flash streaming supplies the FIFO in flash idle cycles;
 DMA does not issue long-latency reads against the memory-mapped flash window.
@@ -36,7 +36,7 @@ cannot guarantee 60 rendered frames per second or recover a PIO FIFO underrun.
 Physics N counts rendered animation iterations, not repeated display refreshes.
 
 The generator builds the flash image from the current peg geometry and GLCD
-font. Pegs are magenta, labels are white, and the rest is black. Balls render
+font. Pegs and labels are magenta; the rest is black. Balls render
 on top of this background. Numbers are formatted only when changed, but must
 still be drawn after each restoration.
 
@@ -52,21 +52,10 @@ Watch these symbols without leaving the CPU halted (PIO continues while halted):
 Measure the rendered frame rate and CPU load on the Pico before claiming a
 speedup. The flash bandwidth cost remains, even with this improved DMA path.
 
-## Four-color framebuffer format
-
-Each framebuffer is 76,800 bytes: 160 bytes per row, four pixels per byte.
-The leftmost pixel is in bits 1:0. Palette indices 0/1/2/3 produce
-BLACK/MAGENTA/CYAN/WHITE (VGA pin values 0/12/7/15).
-
-`rgb4.pio` runs on PIO1 SM0 and expands each index with an instruction lookup
-at PIO address zero. Sixteen pixels arrive per 32-bit DMA word. Every palette
-branch takes ten system cycles per pixel at the current 300 MHz clock.
-PIO0's HSync and VSync programs remain unchanged; PIO0 SM2 (`line_sync.pio`)
-bridges active-line IRQs onto GPIO22 for PIO1. GPIO22 requires no external wire,
-but must not be connected to another active signal. PIO1 and GPIO22 are reserved.
-
-All drawing and background-generation paths use this packing. Serial ball color
-choices are 1=white, 2=magenta, 3=cyan. The physical VGA resistor wiring is unchanged.
+PIO0 HSync and VSync provide timing; PIO0 SM2 (`line_sync.pio`) bridges
+active-line IRQs onto GPIO22 for PIO1. GPIO22 requires no external wire but
+must not be connected to another active signal. PIO1 and GPIO22 are reserved.
+The physical VGA resistor wiring is unchanged.
 
 ## Optional timing overlay
 
@@ -87,3 +76,15 @@ second. A hung renderer cannot refresh an on-screen overlay.
 With the switch enabled, the HUD itself has some overhead, included in measured
 work time. Disable it for final performance runs. The debugger counters mentioned
 above also exist only when the switch is enabled.
+
+## Current two-color format
+
+The active target uses `VGA/rgb2.pio`: eight 1-bit pixels per byte, least
+significant bit first. Zero is black; one outputs GPIO pin value 12 (magenta).
+Legacy nonblack drawing colors all map to magenta. Each 640x480 framebuffer
+uses 38,400 bytes (80 bytes per row); double buffering uses 76,800 bytes.
+The flash background also uses 38,400 bytes. DMA transfers 9,600 32-bit words.
+The decoder uses 12 system cycles per pixel at 300 MHz for a 25 MHz pixel rate.
+The ball array now holds 54,100 eight-byte balls; the initial count is unchanged.
+Run `python tools/check_vga4.py` for the active two-color PIO/background checks
+(the test filename is retained for compatibility).

@@ -10,7 +10,7 @@
 // Each gets the name <pio_filename.pio.h>
 #include "hsync.pio.h"
 #include "vsync.pio.h"
-#include "rgb4.pio.h"
+#include "rgb2.pio.h"
 #include "line_sync.pio.h"
 // Header file
 #include "vga16_graphics_v3.h"
@@ -345,7 +345,7 @@ void initVGA() {
     uint vsync_offset = pio_add_program(pio, &vsync_program);
     uint line_offset = pio_add_program(pio, &line_sync_program);
     PIO rgb_pio = pio1;
-    uint rgb_offset = pio_add_program(rgb_pio, &rgb4_program);
+    uint rgb_offset = pio_add_program(rgb_pio, &rgb2_program);
 
     // Manually select a few state machines from pio instance pio0.
     // void pio_sm_claim (PIO pio, uint sm)
@@ -365,7 +365,7 @@ void initVGA() {
     hsync_program_init(pio, hsync_sm, hsync_offset, HSYNC);
     vsync_program_init(pio, vsync_sm, vsync_offset, VSYNC);
     line_sync_program_init(pio, line_sm, line_offset);
-    rgb4_program_init(rgb_pio, rgb_sm, rgb_offset, LO_GRN);
+    rgb2_program_init(rgb_pio, rgb_sm, rgb_offset, LO_GRN);
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////
     // ============================== PIO DMA Channels =================================================
@@ -461,7 +461,7 @@ void initVGA() {
         &c0,                        // The configuration we just created
         &rgb_pio->txf[rgb_sm],          // write address (RGB PIO TX FIFO)
         &vga_buffer_0,            // The initial read address (pixel color array)
-        VGA_BUFFER_COUNT >> 2,      // 16 pixels per word.
+        VGA_BUFFER_COUNT >> 2,      // 32 pixels per word.
         false                       // Don't start immediately.
     );
 
@@ -554,9 +554,9 @@ void initVGA() {
 // pixels will be automatically updated on the screen.
 void drawPixel(short x, short y, char color) {
     if ((unsigned)x >= 640 || (unsigned)y >= 480) return;
-    uint8_t *dest = (uint8_t *)current_draw_buffer + VGA_ROW_BYTES * y + (x >> 2);
-    unsigned shift = (x & 3) << 1;
-    *dest = (*dest & ~(3u << shift)) | (vga_color_index(color) << shift);
+    uint8_t *dest = (uint8_t *)current_draw_buffer + VGA_ROW_BYTES * y + (x >> 3);
+    unsigned shift = x & 7;
+    *dest = (*dest & ~(1u << shift)) | (vga_color_index(color) << shift);
 }
 static inline void draw_color_pair(int x, int y, unsigned char pair) {
     drawPixel(x, y, pair & 15);
@@ -583,7 +583,7 @@ void drawCell(short x, short y, char color) {
 
 // Check if alive
 int isAlive(short x, short y) {
-    return (readPixel(x<<1, y<<1) & 1) ;
+    return (readPixel(x<<1, y<<1) != BLACK) ;
 }
 
 // vertical line
@@ -601,12 +601,12 @@ void drawHLine(int x, int y, int w, char color) {
     if (x < 0) { w += x; x = 0; }
     if (w > 640 - x) w = 640 - x;
     if (w <= 0) return;
-    while ((x & 3) && w) { drawPixel(x++, y, color); --w; }
-    int bytes = w >> 2;
-    memset(current_draw_buffer + VGA_ROW_BYTES * y + (x >> 2),
-           vga_color_index(color) * 0x55u, bytes);
-    x += bytes << 2;
-    w &= 3;
+    while ((x & 7) && w) { drawPixel(x++, y, color); --w; }
+    int bytes = w >> 3;
+    memset(current_draw_buffer + VGA_ROW_BYTES * y + (x >> 3),
+           vga_color_index(color) * 0xffu, bytes);
+    x += bytes << 3;
+    w &= 7;
     while (w--) drawPixel(x++, y, color);
 }
 
@@ -1442,14 +1442,14 @@ void clearLowFrame(short top, short c) {
     if (top < 0) top = 0;
     if (top >= 480) return;
     memset(current_draw_buffer + VGA_ROW_BYTES * top,
-           vga_color_index(c) * 0x55u, VGA_BUFFER_COUNT - VGA_ROW_BYTES * top);
+           vga_color_index(c) * 0xffu, VGA_BUFFER_COUNT - VGA_ROW_BYTES * top);
 }
 void clearRegion(short y1, short y2, short c) {
     if (y1 < 0) y1 = 0;
     if (y2 > 480) y2 = 480;
     if (y2 <= y1) return;
     memset(current_draw_buffer + VGA_ROW_BYTES * y1,
-           vga_color_index(c) * 0x55u, VGA_ROW_BYTES * (y2 - y1));
+           vga_color_index(c) * 0xffu, VGA_ROW_BYTES * (y2 - y1));
 }
 
 // buffer copy utilities
@@ -1493,10 +1493,10 @@ int get_buffer_type(void){
 // get the color of a pixel
 // but remember there are two buffers!
 short readPixel(short x, short y) {
-    static const unsigned char palette[4] = {BLACK, MAGENTA, CYAN, WHITE};
+    static const unsigned char palette[2] = {BLACK, MAGENTA};
     if ((unsigned)x >= 640 || (unsigned)y >= 480) return BLACK;
-    unsigned char value = ((unsigned char *)current_draw_buffer)[VGA_ROW_BYTES * y + (x >> 2)];
-    return palette[(value >> ((x & 3) << 1)) & 3];
+    unsigned char value = ((unsigned char *)current_draw_buffer)[VGA_ROW_BYTES * y + (x >> 3)];
+    return palette[(value >> (x & 7)) & 1];
 }
   
 ///////////////////////////////////////////////

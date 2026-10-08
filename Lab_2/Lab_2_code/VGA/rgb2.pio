@@ -1,0 +1,39 @@
+; Two-color indexed scanout, 300 MHz system clock / 12 = 25 MHz pixels.
+; PIO1 owns the palette decoder; OUT PC requires this table at address zero.
+.program rgb2
+.origin 0
+jmp black
+jmp magenta
+
+public entry:
+pull block
+mov y, osr
+out null, 32                  ; discard setup count and prime pixel autopull
+.wrap_target
+set pins, 0
+mov x, y
+wait 1 gpio 22 [3]            ; internal line pulse from PIO0, no external wire
+pixel:
+out pc, 1                    ; palette index 0..1; 32 pixels per FIFO word
+black:
+set pins, 0 [7]
+jmp next_pixel
+magenta:
+set pins, 12 [7]
+jmp next_pixel
+next_pixel:
+jmp x-- pixel
+.wrap
+
+% c-sdk {
+static inline void rgb2_program_init(PIO pio, uint sm, uint offset, uint pin) {
+    hard_assert(offset == 0);
+    pio_sm_config c = rgb2_program_get_default_config(offset);
+    sm_config_set_set_pins(&c, pin, 4);
+    sm_config_set_out_shift(&c, true, true, 32);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+    for (uint i = 0; i < 4; ++i) pio_gpio_init(pio, pin + i);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 4, true);
+    pio_sm_init(pio, sm, offset + rgb2_offset_entry, &c);
+}
+%}
