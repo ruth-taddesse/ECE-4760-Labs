@@ -54,7 +54,7 @@ static inline void hsync_program_init(PIO pio, uint sm, uint offset, uint pin) {
 
     // Set clock division (div for 25 MHz state machine on rp2350)
     // OPT: overclocking to 300MHz - div by 12 
-    sm_config_set_clkdiv(&c, 10.0);
+    sm_config_set_clkdiv(&c, 12.0);
 
     // Set this pin's GPIO function (connect PIO to the pad)
     pio_gpio_init(pio, pin);
