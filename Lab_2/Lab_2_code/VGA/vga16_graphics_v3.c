@@ -155,8 +155,15 @@ static uint32_t bg_start_value = 1; // DMA source in RAM
 static volatile bool bg_frame_ready;
 static bool bg_frame_pending;
 // Watch in debugger: repeat count is expected under load; stalls should stay 0.
+#if GALTON_TIMING_DISPLAY
 volatile uint32_t vga_repeated_frames;
 volatile uint32_t vga_rgb_stall_count;
+static volatile uint32_t timing_presented;
+static uint32_t timing_completed;
+static volatile uint32_t timing_started_us;
+static uint64_t timing_total_work_us;
+static uint32_t timing_worst_work_us;
+#endif
 
 static void __not_in_flash_func(background_frame_irq)(void)
 {
@@ -164,11 +171,13 @@ static void __not_in_flash_func(background_frame_irq)(void)
     if (!(dma_hw->ints1 & channel_mask)) return;
     dma_hw->ints1 = channel_mask;
 
+#if GALTON_TIMING_DISPLAY
     const uint32_t stall_mask = 1u << (PIO_FDEBUG_TXSTALL_LSB + 0);
     static bool sampled;
     if (sampled && (pio1->fdebug & stall_mask)) ++vga_rgb_stall_count;
     pio1->fdebug = stall_mask;
     sampled = true;
+#endif
 
     if (bg_frame_ready) {
         __dmb();
@@ -177,6 +186,9 @@ static void __not_in_flash_func(background_frame_irq)(void)
         bg_back = old_front;
         bg_frame_ready = false;
         bg_frame_pending = false;
+#if GALTON_TIMING_DISPLAY
+        ++timing_presented;
+#endif
     }
 
     bg_dispatch_mask = channel_mask;
@@ -186,13 +198,21 @@ static void __not_in_flash_func(background_frame_irq)(void)
         dma_channel_set_trans_count(bg_copy_chan, VGA_BUFFER_COUNT >> 2, false);
         // XIP_AUX + DREQ_XIP_STREAM avoids direct-flash reads blocking the
         // DMA read bus used by RGB. Streaming runs in flash idle cycles.
+#if GALTON_TIMING_DISPLAY
+        // Includes background restoration, physics, both drawing threads,
+        // and the enabled overlay. Excludes waiting to present the finished frame.
+        timing_started_us = time_us_32();
+#endif
         xip_ctrl_hw->stream_addr = (uintptr_t)background_image;
         xip_ctrl_hw->stream_ctr = VGA_BUFFER_COUNT >> 2;
         bg_dispatch_mask |= 1u << bg_copy_chan;
-    } else {
+    }
+#if GALTON_TIMING_DISPLAY
+    else {
         // CPU/copy still owns the back buffer. Display the old frame again.
         ++vga_repeated_frames;
     }
+#endif
     __dmb();
     dma_start_channel_mask(1u << bg_disp_chan);
 }
@@ -273,10 +293,33 @@ static int init_background_pipeline(PIO pio, uint rgb_sm)
 void vga_frame_done(void)
 {
     if (background_image) {
+#if GALTON_TIMING_DISPLAY
+        const uint32_t elapsed_us = time_us_32() - timing_started_us;
+        timing_total_work_us += elapsed_us;
+        ++timing_completed;
+        if (elapsed_us > timing_worst_work_us) timing_worst_work_us = elapsed_us;
+#endif
         __dmb(); // Finish framebuffer writes before publishing to the IRQ.
         bg_frame_ready = true;
     }
 }
+
+#if GALTON_TIMING_DISPLAY
+void vga_timing_snapshot(VgaTimingSnapshot *snapshot)
+{
+    // Driver IRQ and both drawing threads run on core 0. Keep the snapshot
+    // coherent while copying counters; formatting happens after IRQs resume.
+    const uint32_t irq_state = save_and_disable_interrupts();
+    snapshot->sampled_us = time_us_32();
+    snapshot->presented = timing_presented;
+    snapshot->repeated = vga_repeated_frames;
+    snapshot->completed = timing_completed;
+    snapshot->total_work_us = timing_total_work_us;
+    snapshot->worst_work_us = timing_worst_work_us;
+    timing_worst_work_us = 0;
+    restore_interrupts(irq_state);
+}
+#endif
 
 void initVGAWithBackground(const void *image)
 {

@@ -49,7 +49,8 @@ typedef signed int fix15 ;
 
 // ball-related constants
 #define BALL_SPAWN_Y 20
-#define BALL_EXIT_Y 400
+// Respawn once the ball center clears the bottom row's collision region.
+#define BALL_EXIT_Y (FIRST_PEG_Y + (PEG_ROWS - 1) * PEG_VERTICAL_SPACING + PEG_RADIUS + BALL_RADIUS + 1)
 
 // rotary encoder pins
 #define state_pin 13
@@ -57,16 +58,17 @@ typedef signed int fix15 ;
 #define b_pin 15
 
 #define MAX_BALLS 44500
-#define INITIAL_BALLS 44000
+#define INITIAL_BALLS 20000
 
 // histogram location + layout constants
-#define HISTOGRAM_BASELINE 470
+#define HISTOGRAM_BASELINE 458
+#define BIN_COUNT_Y (HISTOGRAM_BASELINE + 2)
 #define HISTOGRAM_HEIGHT 90
 #define BAR_WIDTH 20       // width of each bar in pixels
 #define BAR_SPACING PEG_HORIZONTAL_SPACING // spacing between adjacent bins matches row 16 pegs
 
 // lab-defined constants for ball / peg physics
-#define BALL_RADIUS 4
+#define BALL_RADIUS 1
 #define PEG_RADIUS 6
 #define COLLISION_DISTANCE int2fix15(BALL_RADIUS + PEG_RADIUS)
 #define GRAVITY float2fix15(0.37)
@@ -183,7 +185,7 @@ static inline fix15 collision_normal(fix15 component, uint32_t distance,
 typedef struct {
   int16_t x; // signed fixed point: 5 fractional bits (1/32 pixel)
   int16_t y;
-  int16_t vx; // signed fixed point: 8 fractional bits (1/256 pixel per frame)
+  int16_t vx; // signed fixed point: 10 fractional bits (1/1024 pixel per frame)
   int16_t vy;
 } Ball;
 _Static_assert(sizeof(Ball) == 8, "Ball storage must remain 8 bytes");
@@ -210,21 +212,21 @@ static inline int position_pixel(int16_t position)
     return fix2int15(load_position(position));
 }
 
-// Physics calculations stay Q15; stored positions use Q5 and velocities Q8.
+// Physics calculations stay Q15; stored positions use Q5 and velocities Q10.
 // Round to nearest, with ties away from zero. Saturate instead of wrapping if
-// energetic collisions exceed [-128, 127.99609375] pixels per frame.
+// energetic collisions exceed [-32, 31.9990234375] pixels per frame.
 static inline int16_t store_velocity(fix15 velocity)
 {
-    if (velocity >= INT16_MAX * 128) return INT16_MAX;
-    if (velocity <= INT16_MIN * 128) return INT16_MIN;
-    if (velocity >= 0) return (int16_t)((velocity + 64) >> 7);
-    return (int16_t)(-((-velocity + 64) >> 7));
+    if (velocity >= INT16_MAX * 32) return INT16_MAX;
+    if (velocity <= INT16_MIN * 32) return INT16_MIN;
+    if (velocity >= 0) return (int16_t)((velocity + 16) >> 5);
+    return (int16_t)(-((-velocity + 16) >> 5));
 }
 
 static inline fix15 load_velocity(int16_t velocity)
 {
     // Multiplication is defined for negative values; a signed left shift isn't.
-    return (fix15)velocity * 128;
+    return (fix15)velocity * 32;
 }
 
 typedef struct {
@@ -271,9 +273,6 @@ volatile int animated_balls = INITIAL_BALLS;
 volatile uint32_t total_fallen = 0;
 volatile bool state = true; // true = adjusting # of balls, false = adjusting bounciness
 volatile uint32_t bounciness = float2fix15(0.5);
-static const int8_t ball_half_width[9] = {
-    0, 2, 3, 3, 4, 3, 3, 2, 0
-};
 // VGA stores four 2-bit palette indices per byte, leftmost in the low bits.
 extern char * volatile current_draw_buffer;
 
@@ -284,6 +283,59 @@ static uint32_t ctrl_channel_mask;
 
 //physics frame countdown
 static unsigned int physics_countdown = 0;
+
+#if GALTON_TIMING_DISPLAY
+static void draw_timing_overlay(void)
+{
+    static bool initialized;
+    static VgaTimingSnapshot previous;
+    static char lines[4][40] = {
+        "Presented FPS: --",
+        "Repeated frames/s: --",
+        "Frame work avg: -- ms",
+        "Worst (interval): -- ms"
+    };
+    const uint32_t now_us = time_us_32();
+    if (!initialized) {
+        vga_timing_snapshot(&previous);
+        initialized = true;
+    } else if ((uint32_t)(now_us - previous.sampled_us) >= 1000000u) {
+        VgaTimingSnapshot current;
+        vga_timing_snapshot(&current);
+        const uint32_t elapsed_us = current.sampled_us - previous.sampled_us;
+        const uint32_t presented = current.presented - previous.presented;
+        const uint32_t repeated = current.repeated - previous.repeated;
+        const uint32_t completed = current.completed - previous.completed;
+        // Formatting and rate calculations run only once per second. Scale by
+        // actual elapsed time so a slow renderer still reports accurate rates.
+        const uint32_t fps10 = (uint32_t)((uint64_t)presented * 10000000u / elapsed_us);
+        const uint32_t repeats10 = (uint32_t)((uint64_t)repeated * 10000000u / elapsed_us);
+        const uint32_t average_us = completed ?
+            (uint32_t)((current.total_work_us - previous.total_work_us) / completed) : 0;
+        const uint32_t average_ms10 = (average_us + 50u) / 100u;
+        const uint32_t worst_ms10 = (current.worst_work_us + 50u) / 100u;
+        snprintf(lines[0], sizeof(lines[0]), "Presented FPS: %lu.%lu",
+                 (unsigned long)(fps10 / 10), (unsigned long)(fps10 % 10));
+        snprintf(lines[1], sizeof(lines[1]), "Repeated frames/s: %lu.%lu",
+                 (unsigned long)(repeats10 / 10), (unsigned long)(repeats10 % 10));
+        snprintf(lines[2], sizeof(lines[2]), "Frame work avg: %lu.%lu ms",
+                 (unsigned long)(average_ms10 / 10), (unsigned long)(average_ms10 % 10));
+        snprintf(lines[3], sizeof(lines[3]), "Worst (interval): %lu.%lu ms",
+                 (unsigned long)(worst_ms10 / 10), (unsigned long)(worst_ms10 % 10));
+        previous = current;
+    }
+
+    // The back buffer is restored every frame, so cached text must be redrawn.
+    // This sits below the existing stats and left of the upper peg rows.
+    fillRect(8, 63, 250, 42, BLACK);
+    setTextColor2(WHITE, BLACK);
+    setTextSize(1);
+    for (int i = 0; i < 4; ++i) {
+        setCursor(10, 65 + 10 * i);
+        writeString(lines[i]);
+    }
+}
+#endif
 
 void print_to_vga(int num_balls){
   // Advance whole seconds without the SDK's 64-bit microsecond division.
@@ -338,16 +390,31 @@ void print_to_vga(int num_balls){
     scaled_max_count = histogram_max_count;
   }
 
+  // DMA restores the background, so redraw counts every frame.
+  // Two rows of at most five digits keep even uint32 counts inside each bin.
   for (int i = 0; i < NUM_BINS; i++) {
     int height = (int)quotient_small((uint64_t)bin_counts[i] * HISTOGRAM_HEIGHT,
                                      histogram_max_count, histogram_reciprocal);
 
-    if (height <= 0) continue;
-    drawRect(bin_pixel_x[i],
+    if (height > 0) {
+      drawRect(bin_pixel_x[i],
             HISTOGRAM_BASELINE - height,
             BAR_WIDTH,
             height,
             CYAN);
+    }
+    char digits[11];
+    int length = snprintf(digits, sizeof(digits), "%lu", (unsigned long)bin_counts[i]);
+    int first_length = length > 5 ? length - 5 : length;
+    int second_length = length - first_length;
+    if (second_length) {
+      setCursor(bin_pixel_x[i] + (BAR_WIDTH >> 1) - 3 * second_length,
+                BIN_COUNT_Y + 8);
+      writeString(digits + first_length);
+    }
+    digits[first_length] = '\0';
+    setCursor(bin_pixel_x[i] + (BAR_WIDTH >> 1) - 3 * first_length, BIN_COUNT_Y);
+    writeString(digits);
   }
 }
 
@@ -383,7 +450,7 @@ void gpio_callback_encoder(uint gpio, uint32_t event_mask) {
 
     else {
     int next = number_of_balls +
-               (gpio_get(b_pin) ? 50 : -50);
+               (gpio_get(b_pin) ? 500 : -500);
 
     if (next < 1) next = 1;
     if (next > MAX_BALLS) next = MAX_BALLS;
@@ -452,41 +519,28 @@ void generatePegs(void)
   }
 }
 
-// Specialized radius-4 sprite: contiguous packed-byte writes, no line calls.
+// Visual-only 2x2 sprite spanning (x-1, y-1) through (x, y).
+// BALL_RADIUS still controls collision physics independently of sprite size.
 // Only core 0 renders, so overlapping balls cannot race on shared pixel bytes.
 static void drawBall(int x, int y, char color) {
-    if (x < -BALL_RADIUS || x >= 640 + BALL_RADIUS ||
-        y < -BALL_RADIUS || y >= 480 + BALL_RADIUS) return;
+    if (x < 0 || x > 640 || y < 0 || y > 480) return;
     uint8_t *buffer = (uint8_t *)current_draw_buffer;
     const uint8_t pixel = vga_color_index(color);
     const uint8_t packed = pixel * 0x55u;
-    const bool inside = x >= BALL_RADIUS && x < 640 - BALL_RADIUS &&
-                        y >= BALL_RADIUS && y < 480 - BALL_RADIUS;
-    for (int row = 0; row < 9; ++row) {
-        int py = y + row - BALL_RADIUS;
-        int left = x - ball_half_width[row];
-        int right = x + ball_half_width[row];
-        if (!inside) {
-            if (py < 0 || py >= 480 || right < 0 || left >= 640) continue;
-            if (left < 0) left = 0;
-            if (right >= 640) right = 639;
-        }
+    const int left = x > 0 ? x - 1 : 0;
+    const int right = x < 640 ? x : 639;
+    const int top = y > 0 ? y - 1 : 0;
+    const int bottom = y < 480 ? y : 479;
+    const unsigned mask = ((1u << (2 * (right - left + 1))) - 1u)
+                          << (2 * (left & 3));
+    const uint8_t first_mask = (uint8_t)mask;
+    const uint8_t second_mask = (uint8_t)(mask >> 8);
+    for (int py = top; py <= bottom; ++py) {
         uint8_t *dest = buffer + VGA_ROW_BYTES * py + (left >> 2);
-        if (left & 3) {
-            int count = 4 - (left & 3);
-            if (count > right - left + 1) count = right - left + 1;
-            unsigned mask = ((1u << (2 * count)) - 1u) << (2 * (left & 3));
-            *dest = (*dest & ~mask) | (packed & mask);
-            ++dest;
-            left += count;
-        }
-        while (left + 3 <= right) {
-            *dest++ = packed;
-            left += 4;
-        }
-        if (left <= right) {
-            unsigned mask = (1u << (2 * (right - left + 1))) - 1u;
-            *dest = (*dest & ~mask) | (packed & mask);
+        dest[0] = (dest[0] & ~first_mask) | (packed & first_mask);
+        // A pair starting at the last pixel in a byte crosses into the next.
+        if (second_mask) {
+            dest[1] = (dest[1] & ~second_mask) | (packed & second_mask);
         }
     }
 }
@@ -697,7 +751,7 @@ collision_done:
     }
 
     if (y > exit_y) {
-        // Preserve bottom-exit detection even if rounding would return y to 400.
+        // Preserve bottom-exit detection even if rounding returns y to the boundary.
         // Clamping an offscreen x still selects the same outer histogram bin.
         ball->x = store_position(x);
         ball->y = (int16_t)(BALL_EXIT_Y * 32 + 1);
@@ -785,6 +839,9 @@ static PT_THREAD(protothread_draw_count(struct pt *pt))
     while (1) {
         PT_SEM_SDK_WAIT(pt, &draw_count_start);
         print_to_vga(animated_balls);
+#if GALTON_TIMING_DISPLAY
+        draw_timing_overlay();
+#endif
         PT_SEM_SDK_SIGNAL(pt, &draw_count_done);
     }
 

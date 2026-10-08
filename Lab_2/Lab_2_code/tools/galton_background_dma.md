@@ -67,3 +67,23 @@ but must not be connected to another active signal. PIO1 and GPIO22 are reserved
 
 All drawing and background-generation paths use this packing. Serial ball color
 choices are 1=white, 2=magenta, 3=cyan. The physical VGA resistor wiring is unchanged.
+
+## Optional timing overlay
+
+Set `GALTON_TIMING_DISPLAY` in `galton_config.h` to `true` or `false`, then
+rebuild. It is enabled by default. Both the application and driver share this
+compile-time switch. When false, the timing calls, state, diagnostic counters,
+formatting, and overlay rendering are omitted from compilation.
+
+The four lines below the normal statistics show presented FPS, repeated display
+frames per second, average completed-frame work time, and worst completed-frame
+work time in the last sample interval. Rates use measured elapsed time rather
+than assuming every update arrives exactly one second apart. Work time begins
+just before background streaming and ends in `vga_frame_done()`, including the
+count thread and timing-overlay drawing. It excludes waiting to present a ready
+frame. The first interval shows placeholders; metrics update about once per
+second. A hung renderer cannot refresh an on-screen overlay.
+
+With the switch enabled, the HUD itself has some overhead, included in measured
+work time. Disable it for final performance runs. The debugger counters mentioned
+above also exist only when the switch is enabled.

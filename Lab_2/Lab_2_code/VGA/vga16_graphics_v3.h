@@ -23,6 +23,9 @@
  */
 
 
+#include "../galton_config.h"
+#include <stdint.h>
+
 // Give the I/O pins that we're using some names that make sense - usable in main()
  enum vga_pins {HSYNC=16, VSYNC, LO_GRN, HI_GRN, BLUE_PIN, RED_PIN} ;
 
@@ -54,6 +57,19 @@ void initVGA(void) ;
 void initVGAWithBackground(const void *image);
 // Publish a completed frame, after ALL drawing threads finish.
 void vga_frame_done(void);
+
+#if GALTON_TIMING_DISPLAY
+typedef struct {
+    uint32_t sampled_us;
+    uint32_t presented;
+    uint32_t repeated;
+    uint32_t completed;
+    uint64_t total_work_us;
+    uint32_t worst_work_us;
+} VgaTimingSnapshot;
+// Call once per display update (about 1 Hz); resets the interval's worst time.
+void vga_timing_snapshot(VgaTimingSnapshot *snapshot);
+#endif
 
 // ========================
 // sync signals from DMA channel to thread
