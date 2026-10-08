@@ -60,7 +60,7 @@ BLACK/MAGENTA/CYAN/WHITE (VGA pin values 0/12/7/15).
 
 `rgb4.pio` runs on PIO1 SM0 and expands each index with an instruction lookup
 at PIO address zero. Sixteen pixels arrive per 32-bit DMA word. Every palette
-branch takes ten system cycles per pixel at the current 250 MHz clock.
+branch takes ten system cycles per pixel at the current 300 MHz clock.
 PIO0's HSync and VSync programs remain unchanged; PIO0 SM2 (`line_sync.pio`)
 bridges active-line IRQs onto GPIO22 for PIO1. GPIO22 requires no external wire,
 but must not be connected to another active signal. PIO1 and GPIO22 are reserved.

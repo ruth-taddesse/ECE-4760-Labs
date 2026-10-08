@@ -3,15 +3,13 @@
 ; RGB generation for VGA driver
 ; mod by Bruce Land for 16 colors
 
-// OPT: update constants for 300 MHz
+// Timing constants for a 300 MHz system clock
 ; Program name
 .program rgb
-; define the pixel hold times which depend on clock freq
-; pixel1hold should be 5 for 150 MHz  (4 for 125 MHz)
-; pixel2hold should be 3 for 150 MHz  (2 for 125 MHz)
-.define pixel1hold 17
-.define pixel2hold 9
-.define PUBLIC vid_freq 350
+; At 300 MHz, these delays produce 12 system cycles per pixel (25 MHz).
+.define pixel1hold 14
+.define pixel2hold 8
+.define PUBLIC vid_freq 300
 
 pull block 					; Pull from FIFO to OSR (only once)
 mov y, osr 					; Copy value from OSR to y scratch register

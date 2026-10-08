@@ -630,8 +630,8 @@ void initAudio() { // 40 ms decaying tone
   channel_config_set_read_increment(&data_config, true);                       // yes read incrementing
   channel_config_set_write_increment(&data_config, false);                     // no write incrementing
   
-  // DMA timer 0 at 25 kHz: 350 MHz system clock / 14000.
-  dma_timer_set_fraction(0, 1, 14000);
+  // DMA timer 0 at 25 kHz: 300 MHz system clock / 12000.
+  dma_timer_set_fraction(0, 1, 12000);
   // transfer one DAC sample per request from DMA timer 0
   channel_config_set_dreq(&data_config, dma_get_timer_dreq(0));
   // playback stops after buffer
@@ -1005,7 +1005,7 @@ static PT_THREAD(protothread_anim(struct pt *pt))
 int main(){
     vreg_set_voltage(VREG_VOLTAGE_1_30);
     sleep_ms(10);
-    set_sys_clock_khz(350000, true) ; // 
+    set_sys_clock_khz(300000, true) ; // 
     // initialize stio
     stdio_init_all() ;
 
