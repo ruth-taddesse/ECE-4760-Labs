@@ -33,7 +33,9 @@ pico_sdk_init()
 add_executable(PWM_Helicopter)
 
 # must match with executable name and source file names
-target_sources(PWM_Helicopter PRIVATE pwm-helicopter.c)
+target_sources(PWM_Helicopter PRIVATE #pwm-helicopter.c
+                                        imu_demo.c
+                                        mpu6050.c)
 
 pico_enable_stdio_usb(PWM_Helicopter 1)
 pico_enable_stdio_uart(PWM_Helicopter 0)
