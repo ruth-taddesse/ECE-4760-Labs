@@ -4,7 +4,7 @@
  *
  * - GP4 (physical pin 6): PWM signal to input of course optoisolated motor PCB
  * - connect the Pico USB cable and open its USB serial port
- * - use any terminal at 115200 baud, 8N1, with Enter sending CR or LF
+ * - use any terminal at 115200 baud, 8N1, with Enter sending CR or CRLF
  * - GP4 (physical pin 6) is the PWM output to the motor circuit
  *
  * ## notes
@@ -84,9 +84,12 @@ static PT_THREAD (protothread_serial(struct pt *pt))
     while (!stdio_usb_connected()) {
         PT_YIELD_usec(10000);
     }
+    // Allow the terminal to settle after the USB connection opens.
+    PT_YIELD_usec(500000);
 
     printf("Helicopter week 1: GP4, ~1 kHz, startup duty 0.\r\n");
     printf("input a duty cycle (0-6000): ");
+    stdio_flush();
     while(1) {
         ch = getchar_timeout_us(0);
         if (ch == PICO_ERROR_TIMEOUT) {
@@ -94,7 +97,10 @@ static PT_THREAD (protothread_serial(struct pt *pt))
             continue;
         }
 
-        if (ch == '\r' || ch == '\n') {
+        // serial monitor: use CR / CRLF as line ending - CR submits the line, LF ignored
+        if (ch == '\n') continue;
+
+        if (ch == '\r') {
             input[input_length] = '\0';
             if (sscanf(input, "%d", &test_in) == 1 &&
                 test_in >= 0 && test_in <= PWM_COUNTS) {
@@ -107,6 +113,7 @@ static PT_THREAD (protothread_serial(struct pt *pt))
             }
             input_length = 0;
             printf("input a duty cycle (0-6000): ");
+            stdio_flush();
         } else if (ch == '\b' || ch == 127) {
             if (input_length > 0) {
                 input_length--;
