@@ -90,7 +90,13 @@ static struct pt_sem vga_semaphore ;
 // Some paramters for PWM
 #define WRAPVAL 6000
 #define CLKDIV  25.0
-uint slice_num ;
+int slice_num ;
+
+volatile fix15 filtered_ax;
+volatile fix15 filtered_az;
+fix15 accel_angle;
+fix15 gyro_angle_delta;
+fix15 complementary_angle;
 
 
 void drawAxes() {
@@ -144,13 +150,13 @@ void on_pwm_wrap() {
     // the raw measurements.
     mpu6050_read_raw(acceleration, gyro);
 
-    //low pass accerleration
+    //l ow pass accerleration
 
     ax = acceleration[0];
     az = acceleration[2];
 
     filtered_ax = ax + ((control - ax)>>6);
-    filtered_ax = az + ((control - az)>>6);
+    filtered_az = az + ((control - az)>>6);
 
 
     // NO SMALL ANGLE APPROXIMATION
