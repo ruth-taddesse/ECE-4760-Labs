@@ -144,6 +144,24 @@ void on_pwm_wrap() {
     // the raw measurements.
     mpu6050_read_raw(acceleration, gyro);
 
+    //low pass accerleration
+
+    ax = acceleration[0];
+    az = acceleration[2];
+
+    filtered_ax = ax + ((control - ax)>>6);
+    filtered_ax = az + ((control - az)>>6);
+
+
+    // NO SMALL ANGLE APPROXIMATION
+    accel_angle = multfix15(float2fix15(atan2(-filtered_ax, filtered_az) + PI), oneeightyoverpi);
+
+    // Gyro angle delta (measurement times timestep) (15.16 fixed point)
+    gyro_angle_delta = multfix15(gyro[2], zeropt001) ;
+
+    // Complementary angle (degrees - 15.16 fixed point)
+    complementary_angle = multfix15(complementary_angle - gyro_angle_delta, zeropt999) + multfix15(accel_angle, zeropt001);
+
     // Increment drawspeed controller
     throttle += 1 ;
     // Maintain a circular buffer for display
