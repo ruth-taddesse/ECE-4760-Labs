@@ -369,57 +369,130 @@ static PT_THREAD (protothread_draw(struct pt *pt))
     PT_END(pt) ;
 }
 
+// USB line reader - stores completed line in the existing input buffer
+static PT_THREAD(protothread_usb_read(struct pt *pt))
+{
+    PT_BEGIN(pt);
+
+    static int ch;
+    static int length;
+    length = 0;
+
+    while (1) {
+        ch = getchar_timeout_us(0);
+
+        // no input yet - let other work run, then try again
+        if (ch == PICO_ERROR_TIMEOUT) {
+            PT_YIELD_usec(1000);
+            continue;
+        }
+
+        // CR submits the line (ignore LF from CRLF)
+        if (ch == '\n') continue;
+
+        if (ch == '\r') {
+            pt_serial_in_buffer[length] = '\0';
+            printf("\r\n");
+            stdio_flush();
+            break;
+        }
+
+        // backspace
+        if (ch == '\b' || ch == 127) {
+            if (length > 0) {
+                length--;
+                printf("\b \b");
+                stdio_flush();
+            }
+        }
+        // store + echo printable characters without overflowing buffer
+        else if (ch >= 32 && ch <= 126 &&
+                 length < (int)sizeof(pt_serial_in_buffer) - 1) {
+            pt_serial_in_buffer[length++] = (char)ch;
+            putchar(ch);
+            stdio_flush();
+        }
+    }
+
+    PT_END(pt);
+}
+
 // User input thread. User can change PID constants
 static PT_THREAD (protothread_serial(struct pt *pt))
 {
     PT_BEGIN(pt) ;
     static char classifier ;
     static float float_in ;
+    static struct pt usb_read_pt;
+
+    // wait until USB serial monitor connects
+    while (!stdio_usb_connected()) {
+        PT_YIELD_usec(10000);
+    }
+    PT_YIELD_usec(500000); // slight delay before printing first prompt
     
     while(1) {
         sprintf(pt_serial_out_buffer, "Enter command (p, i, d, or s for status): ");
-        serial_write ;
+        printf("%s", pt_serial_out_buffer);
+        stdio_flush();
         
         // Spawn a thread to do the non-blocking serial read
-        serial_read ;
+        PT_SPAWN(pt, &usb_read_pt, protothread_usb_read(&usb_read_pt));
         
         // Read the first character command
-        sscanf(pt_serial_in_buffer, "%c", &classifier) ;
+        classifier = '\0';
+        sscanf(pt_serial_in_buffer, " %c", &classifier);
 
         //prop
         if (classifier == 'p' || classifier == 'P') {
             sprintf(pt_serial_out_buffer, "New Kp: ");
-            serial_write ;
-            serial_read ;
-            sscanf(pt_serial_in_buffer, "%f", &float_in) ;
-            kp = float_in ;
-            sprintf(pt_serial_out_buffer, "-> Kp updated to %f\n\r", kp);
-            serial_write ;
+            printf("%s", pt_serial_out_buffer);
+            stdio_flush();
+            PT_SPAWN(pt, &usb_read_pt, protothread_usb_read(&usb_read_pt));
+            if (sscanf(pt_serial_in_buffer, "%f", &float_in) == 1 &&
+                isfinite(float_in) && float_in >= 0.0f) {
+                kp = float_in;
+                printf("-> Kp updated to %f\r\n", kp);
+            } else {
+                printf("Invalid gain; Kp unchanged\r\n");
+            }
+            stdio_flush();
         }
         //integral
         else if (classifier == 'i' || classifier == 'I') {
             sprintf(pt_serial_out_buffer, "New Ki: ");
-            serial_write ;
-            serial_read ;
-            sscanf(pt_serial_in_buffer, "%f", &float_in) ;
-            ki = float_in ;
-            sprintf(pt_serial_out_buffer, "-> Ki updated to %f\n\r", ki);
-            serial_write ;
+            printf("%s", pt_serial_out_buffer);
+            stdio_flush();
+            PT_SPAWN(pt, &usb_read_pt, protothread_usb_read(&usb_read_pt));
+            if (sscanf(pt_serial_in_buffer, "%f", &float_in) == 1 &&
+                isfinite(float_in) && float_in >= 0.0f) {
+                ki = float_in;
+                printf("-> Ki updated to %f\r\n", ki);
+            } else {
+                printf("Invalid gain; Ki unchanged\r\n");
+            }
+            stdio_flush();
         }
         //deriv
         else if (classifier == 'd' || classifier == 'D') {
             sprintf(pt_serial_out_buffer, "New Kd: ");
-            serial_write ;
-            serial_read ;
-            sscanf(pt_serial_in_buffer, "%f", &float_in) ;
-            kd = float_in ;
-            sprintf(pt_serial_out_buffer, "-> Kd updated to %f\n\r", kd);
-            serial_write ;
+            printf("%s", pt_serial_out_buffer);
+            stdio_flush();
+            PT_SPAWN(pt, &usb_read_pt, protothread_usb_read(&usb_read_pt));
+            if (sscanf(pt_serial_in_buffer, "%f", &float_in) == 1 &&
+                isfinite(float_in) && float_in >= 0.0f) {
+                kd = float_in;
+                printf("-> Kd updated to %f\r\n", kd);
+            } else {
+                printf("Invalid gain; Kd unchanged\r\n");
+            }
+            stdio_flush();
         }
         //print
         else if (classifier == 's' || classifier == 'S') {
             sprintf(pt_serial_out_buffer, "\n\rCurrent PID -> Kp: %f | Ki: %f | Kd: %f\n\r", kp, ki, kd);
-            serial_write ;
+            printf("%s", pt_serial_out_buffer);
+            stdio_flush();
         }
     }
     PT_END(pt) ;
