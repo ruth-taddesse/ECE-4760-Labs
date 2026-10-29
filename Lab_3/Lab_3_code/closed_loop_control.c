@@ -136,7 +136,7 @@ volatile float integral;
 volatile float deriv;
 volatile float kp = 75.0f; //inital 27
 volatile float ki = 20.0f;
-volatile float kd = 15.0f;
+volatile float kd = 10.0f;
 
 
 void drawAxes() {
@@ -492,6 +492,20 @@ static PT_THREAD (protothread_serial(struct pt *pt))
         else if (classifier == 's' || classifier == 'S') {
             sprintf(pt_serial_out_buffer, "\n\rCurrent PID -> Kp: %f | Ki: %f | Kd: %f\n\r", kp, ki, kd);
             printf("%s", pt_serial_out_buffer);
+            stdio_flush();
+        }
+        else if (classifier == 't' || classifier == 'T') {
+            sprintf(pt_serial_out_buffer, "New Target Angle:");
+            printf("%s", pt_serial_out_buffer);
+            stdio_flush();
+            PT_SPAWN(pt, &usb_read_pt, protothread_usb_read(&usb_read_pt));
+            if (sscanf(pt_serial_in_buffer, "%f", &float_in) == 1 &&
+                isfinite(float_in) && float_in >= 0.0f) {
+                target_angle = float_in;
+                printf("-> Target angle updated to %f\r\n", target_angle);
+            } else {
+                printf("Invalid target angle; value is unchanged\r\n");
+            }
             stdio_flush();
         }
     }
