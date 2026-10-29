@@ -36,7 +36,9 @@ pico_generate_pio_header(MPU6050_IMU ${CMAKE_CURRENT_LIST_DIR}/VGA/vsync.pio)
 pico_generate_pio_header(MPU6050_IMU ${CMAKE_CURRENT_LIST_DIR}/VGA/rgb.pio)
 
 # must match with executable name and source file names
-target_sources(MPU6050_IMU PRIVATE imu_demo.c VGA/vga16_graphics_v3.c mpu6050.c)
+target_sources(MPU6050_IMU PRIVATE #imu_demo.c
+                                    closed_loop_control.c 
+                                    VGA/vga16_graphics_v3.c mpu6050.c)
 
 # Add pico_multicore which is required for multicore functionality
 target_link_libraries(  MPU6050_IMU
@@ -50,7 +52,11 @@ target_link_libraries(  MPU6050_IMU
                         hardware_pio
                         hardware_sync
                         hardware_i2c
-                        hardware_clocks)
+                        hardware_clocks
+                        )
+
+pico_enable_stdio_usb(MPU6050_IMU 1)
+pico_enable_stdio_uart(MPU6050_IMU 0)
 
 # create map/bin/hex file etc.
 pico_add_extra_outputs(MPU6050_IMU)

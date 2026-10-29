@@ -51,13 +51,19 @@
 #define OLD_RANGE 500.  // (+/- 250)
 #define NEW_RANGE 150.  // (looks nice on VGA)
 #define OLD_MIN -250. 
-#define OLD_MAX 250. 
+#define OLD_MAX 250. slice_num
 #define ACCEL_SCALE 120.0
 
 // Place the plots
 #define TOP_PLOT_BOTTOM 230
 #define BOTTOM_PLOT_BOTTOM 430
 #define PLOT_WIDTH 530
+
+#define PI 3.14159265358979323846
+
+// === the fixed point macros ========================================
+#define absfix15(a) abs(a) 
+#define char2fix15(a) (fix15)(((fix15)(a)) << 15)
 
 // Arrays in which raw measurements will be stored
 fix15 acceleration[3], gyro[3];
@@ -88,15 +94,30 @@ volatile int threshold = 10 ;
 static struct pt_sem vga_semaphore ;
 
 // Some paramters for PWM
-#define WRAPVAL 6000
 #define CLKDIV  25.0
-int slice_num ;
 
 volatile fix15 filtered_ax;
 volatile fix15 filtered_az;
 fix15 accel_angle;
 fix15 gyro_angle_delta;
-fix15 complementary_angle;
+volatile fix15 complementary_angle;
+
+// 6000 counter ticks per period: level 6000 = 100%.
+#define PWM_COUNTS 6000
+#define WRAPVAL (PWM_COUNTS - 1)
+#define PWM_HZ 1000
+// w/inversion: level 0 produces constant HIGH output
+#define PWM_INVERTED false
+
+// GPIO we're using for PWM
+#define PWM_OUT 4
+
+// Variable to hold PWM slice number
+uint slice_num ;
+
+// PWM duty cycle
+volatile int control ;
+volatile int old_control ;
 
 
 void drawAxes() {
@@ -141,7 +162,12 @@ volatile int throttle = 10 ;
 void on_pwm_wrap() {
 
     // Clear the interrupt flag that brought us here
-    pwm_clear_irq(pwm_gpio_to_slice_num(5));
+    pwm_clear_irq(pwm_gpio_to_slice_num(PWM_OUT));
+    // Update duty cycle
+    if (control!=old_control) {
+        old_control = control ;
+        pwm_set_chan_level(slice_num, PWM_CHAN_A, control);
+    }
     gpio_put(14, !gpio_get(14)) ;
 
     // Read the IMU
@@ -150,24 +176,7 @@ void on_pwm_wrap() {
     // the raw measurements.
     mpu6050_read_raw(acceleration, gyro);
 
-    //l ow pass accerleration
-
-    ax = acceleration[0];
-    az = acceleration[2];
-
-    filtered_ax = ax + ((control - ax)>>6);
-    filtered_az = az + ((control - az)>>6);
-
-
-    // NO SMALL ANGLE APPROXIMATION
-    accel_angle = multfix15(float2fix15(atan2(-filtered_ax, filtered_az) + PI), oneeightyoverpi);
-
-    // Gyro angle delta (measurement times timestep) (15.16 fixed point)
-    gyro_angle_delta = multfix15(gyro[2], zeropt001) ;
-
-    // Complementary angle (degrees - 15.16 fixed point)
-    complementary_angle = multfix15(complementary_angle - gyro_angle_delta, zeropt999) + multfix15(accel_angle, zeropt001);
-
+    
     // Increment drawspeed controller
     throttle += 1 ;
     // Maintain a circular buffer for display
@@ -189,6 +198,27 @@ void on_pwm_wrap() {
         head = ((head+1) == PLOT_WIDTH) ? 0 : (head + 1) ;
 
     }
+
+    //low pass accerleration
+
+    filtered_ax = filtered_ax + ((acceleration[0] - filtered_ax)>>6);
+    filtered_az = filtered_az + ((acceleration[2] - filtered_az)>>6);
+
+    // NO SMALL ANGLE APPROXIMATION
+    accel_angle = multfix15(float2fix15(atan2(-filtered_ax, filtered_az) + PI), oneeightyoverpi);
+
+    accel_angle -= int2fix15(90);
+
+    // Gyro angle delta (measurement times timestep) (15.16 fixed point)
+    gyro_angle_delta = multfix15(gyro[1], zeropt001) ;
+
+    // Complementary angle (degrees - 15.16 fixed point)
+    //change to plus becasue of how imu is mounted
+    complementary_angle = multfix15(complementary_angle + gyro_angle_delta, zeropt999) + multfix15(accel_angle, zeropt001);
+
+
+
+
 }
 
 static PT_THREAD (protothread_draw(struct pt *pt))
@@ -197,6 +227,8 @@ static PT_THREAD (protothread_draw(struct pt *pt))
 
     static int start ;
     static int i ;
+    static int angle_hundredths;
+    static int angle_magnitude;
 
     // Draw axes
     drawAxes() ;
@@ -229,36 +261,102 @@ static PT_THREAD (protothread_draw(struct pt *pt))
                 (int)(NEW_RANGE*((float)((fix2float15(gz[start]))-OLD_MIN)/OLD_RANGE))), GREEN) ;
             start = ((start+1)==PLOT_WIDTH) ? 0 : (start+1) ;
         }
+
+        // Convert the 15.16 fixed-point angle to hundredths of a degree.
+        angle_hundredths = (int)(((signed long long)complementary_angle * 100) >> 16);
+        angle_magnitude = abs(angle_hundredths);
+        snprintf(screentext, sizeof(screentext), "Angle: %s%d.%02d deg",
+                 angle_hundredths < 0 ? "-" : "",
+                 angle_magnitude / 100, angle_magnitude % 100);
+        setTextColor(YELLOW);
+        setCursor(250, 20);
+        writeString(screentext);
     }
 
     PT_END(pt) ;
 }
 
-// User input thread. User can change draw speed
+// // User input thread. User can change draw speed
+// static PT_THREAD (protothread_serial(struct pt *pt))
+// {
+//     PT_BEGIN(pt) ;
+//     static char classifier ;
+//     static int test_in ;
+//     static float float_in ;
+//     while(1) {
+//         sprintf(pt_serial_out_buffer, "input a command: ");
+//         serial_write ;
+//         // spawn a thread to do the non-blocking serial read
+//         serial_read ;
+//         // convert input string to number
+//         sscanf(pt_serial_in_buffer,"%c", &classifier) ;
+
+//         // num_independents = test_in ;
+//         if (classifier=='t') {
+//             sprintf(pt_serial_out_buffer, "timestep: ");
+//             serial_write ;
+//             serial_read ;
+//             // convert input string to number
+//             sscanf(pt_serial_in_buffer,"%d", &test_in) ;
+//             if (test_in > 0) {
+//                 threshold = test_in ;
+//             }
+//         }
+//     }
+//     PT_END(pt) ;
+// }
+
+// USB serial control thread
 static PT_THREAD (protothread_serial(struct pt *pt))
 {
     PT_BEGIN(pt) ;
-    static char classifier ;
-    static int test_in ;
-    static float float_in ;
-    while(1) {
-        sprintf(pt_serial_out_buffer, "input a command: ");
-        serial_write ;
-        // spawn a thread to do the non-blocking serial read
-        serial_read ;
-        // convert input string to number
-        sscanf(pt_serial_in_buffer,"%c", &classifier) ;
+    static char input[16];
+    static int input_length;
+    static int ch;
+    static int test_in;
 
-        // num_independents = test_in ;
-        if (classifier=='t') {
-            sprintf(pt_serial_out_buffer, "timestep: ");
-            serial_write ;
-            serial_read ;
-            // convert input string to number
-            sscanf(pt_serial_in_buffer,"%d", &test_in) ;
-            if (test_in > 0) {
-                threshold = test_in ;
+    while (!stdio_usb_connected()) {
+        PT_YIELD_usec(10000);
+    }
+    // Allow the terminal to settle after the USB connection opens.
+    PT_YIELD_usec(500000);
+
+    printf("Helicopter week 1: GP4, ~1 kHz, startup duty 0.\r\n");
+    printf("input a duty cycle (0-6000): ");
+    stdio_flush();
+    while(1) {
+        ch = getchar_timeout_us(0);
+        if (ch == PICO_ERROR_TIMEOUT) {
+            PT_YIELD_usec(1000);
+            continue;
+        }
+
+        // serial monitor: use CR / CRLF as line ending - CR submits the line, LF ignored
+        if (ch == '\n') continue;
+
+        if (ch == '\r') {
+            input[input_length] = '\0';
+            if (sscanf(input, "%d", &test_in) == 1 &&
+                test_in >= 0 && test_in <= PWM_COUNTS) {
+                control = test_in;
+                pwm_set_chan_level(slice_num, pwm_gpio_to_channel(PWM_OUT),
+                                   (uint16_t)control);
+                printf("\r\nDuty cycle set to %d\r\n", control);
+            } else {
+                printf("\r\nEnter an integer from 0 to 6000\r\n");
             }
+            input_length = 0;
+            printf("input a duty cycle (0-6000): ");
+            stdio_flush();
+        } else if (ch == '\b' || ch == 127) {
+            if (input_length > 0) {
+                input_length--;
+                printf("\b \b");
+            }
+        } else if (ch >= '0' && ch <= '9' &&
+                   input_length < (int)sizeof(input) - 1) {
+            input[input_length++] = (char)ch;
+            putchar(ch);
         }
     }
     PT_END(pt) ;
@@ -293,6 +391,17 @@ int main() {
     // MPU6050 initialization
     mpu6050_reset();
     mpu6050_read_raw(acceleration, gyro);
+
+    filtered_ax = acceleration[0];
+    filtered_az = acceleration[2];  
+
+    accel_angle = multfix15(
+    float2fix15(atan2(-filtered_ax, filtered_az) + PI),
+    oneeightyoverpi
+    );
+
+    accel_angle -= int2fix15(90);
+    complementary_angle = accel_angle;
 
     ////////////////////////////////////////////////////////////////////////
     ///////////////////////// PWM CONFIGURATION ////////////////////////////
