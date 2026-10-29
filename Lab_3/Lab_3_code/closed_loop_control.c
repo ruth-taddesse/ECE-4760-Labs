@@ -57,7 +57,9 @@
 // Place the plots
 #define TOP_PLOT_BOTTOM 230
 #define BOTTOM_PLOT_BOTTOM 430
-#define PLOT_WIDTH 530
+// Leave room to the right for live numeric readouts.
+#define PLOT_WIDTH 430
+#define VALUE_X (LEFT_EDGE + PLOT_WIDTH + 10)
 
 #define PI 3.14159265358979323846
 
@@ -121,16 +123,20 @@ volatile int old_control ;
 volatile float filtered_control = 0.0f;
 volatile fix15 angle_history[PLOT_WIDTH]; // for VGA display
 volatile float motor_history[PLOT_WIDTH]; // "
+static float prop_history[PLOT_WIDTH];
+static float integral_history[PLOT_WIDTH];
+static float deriv_history[PLOT_WIDTH];
+static fix15 target_history[PLOT_WIDTH];
 
 //PID Loop
-volatile fix15 target_angle = int2fix15(90);
+volatile fix15 target_angle = int2fix15(110);
 volatile float error;
 volatile float prop;
 volatile float integral;
 volatile float deriv;
-volatile float kp = 27.0f; //inital 27
-volatile float ki = 0.0f;
-volatile float kd = 0.0f;
+volatile float kp = 75.0f; //inital 27
+volatile float ki = 20.0f;
+volatile float kd = 15.0f;
 
 
 void drawAxes() {
@@ -143,14 +149,14 @@ void drawAxes() {
     drawHLine(75, 355, 5, CYAN) ;
     drawHLine(75, 280, 5, CYAN) ;
     drawVLine(80, 280, 150, CYAN) ;
-    sprintf(screentext, "3000") ;
+    sprintf(screentext, "0") ;
     setCursor(50, 350) ;
     writeString(screentext) ;
     sprintf(screentext, "6000") ;
     setCursor(50, 280) ;
     writeString(screentext) ;
-    sprintf(screentext, "0") ;
-    setCursor(50, 425) ;
+    sprintf(screentext, "-6000") ;
+    setCursor(44, 425) ;
     writeString(screentext) ;
 
     // Draw top plot
@@ -158,20 +164,37 @@ void drawAxes() {
     drawHLine(75, 155, 5, CYAN) ;
     drawHLine(75, 80, 5, CYAN) ;
     drawVLine(80, 80, 150, CYAN) ;
-    sprintf(screentext, "0") ;
+    sprintf(screentext, "135") ;
     setCursor(50, 150) ;
     writeString(screentext) ;
-    sprintf(screentext, "+90") ;
+    sprintf(screentext, "270") ;
     setCursor(45, 75) ;
     writeString(screentext) ;
-    sprintf(screentext, "-90") ;
+    sprintf(screentext, "0") ;
     setCursor(45, 225) ;
     writeString(screentext) ;
 
     setCursor(81, 60);
+    setTextColor(YELLOW);
     writeString("Measured angle (deg)");
+    setCursor(250, 60);
+    setTextColor(WHITE);
+    writeString("Target (deg)");
     setCursor(81, 260);
-    writeString("Filtered motor command (PWM counts)");
+    writeString("Motor and PID terms (PWM counts, +/-6000)");
+    setCursor(81, 450);
+    setTextColor(GREEN);
+    writeString("Motor (filtered)");
+    setCursor(210, 450);
+    setTextColor(RED);
+    writeString("Prop");
+    setCursor(285, 450);
+    setTextColor(CYAN);
+    writeString("Integral");
+    setCursor(385, 450);
+    setTextColor(MAGENTA);
+    writeString("Deriv");
+    setTextColor(WHITE);
 }
 
 // convert value to screen coordinate (clipped to graph)
@@ -179,6 +202,14 @@ static int plot_y(float value, float low, float high, int bottom) {
     if (value < low) value = low;
     if (value > high) value = high;
     return bottom - (int)((value - low) * 150.0f / (high - low));
+}
+
+// Fixed rows keep readouts legible even when traces overlap.
+static void draw_value(const char *label, float value, int y, char color) {
+    setTextColor(color);
+    setCursor(VALUE_X, y);
+    snprintf(screentext, sizeof(screentext), "%s: %.1f", label, (double)value);
+    writeString(screentext);
 }
 
 volatile int throttle = 10 ;
@@ -224,14 +255,14 @@ void on_pwm_wrap() {
     prop = kp * error;
     integral += ki * error * 0.001f;
 
-    if (integral > 500.0f) integral = 500.0f;
-    if (integral < -500.0f) integral = -500.0f;
+    if (integral > 3000.0f) integral = 3000.0f;
+    if (integral < -3000.0f) integral = -3000.0f;
     deriv = -kd * angular_velocity;
 
     int pid_output = prop + integral + deriv;
 
-    if (pid_output > 2500) {
-        pid_output = 2500;
+    if (pid_output > 4000) {
+        pid_output = 4000;
     }
     else if (pid_output < 0) {
         pid_output = 0;
@@ -253,6 +284,7 @@ static PT_THREAD (protothread_draw(struct pt *pt))
 
     static int start ;
     static int i ;
+    static int latest;
     static int angle_hundredths;
     static int angle_magnitude;
 
@@ -266,39 +298,65 @@ static PT_THREAD (protothread_draw(struct pt *pt))
         PT_YIELD_UNTIL(pt, draw_start_signal()) ;
         gpio_put(15, !gpio_get(15)) ;
 
-        // assign current angle + motor command to VGA display buffers
+        // Sample angle, motor command, and PID terms once per display frame.
         angle_history[head] = complementary_angle;
+        target_history[head] = target_angle;
         motor_history[head] = filtered_control;
+        prop_history[head] = prop;
+        integral_history[head] = integral;
+        deriv_history[head] = deriv;
+        latest = head;
 
         head = ((head + 1) == PLOT_WIDTH) ? 0 : head + 1;
         
         // Clear the buffer, draw the axes
         clearLowFrame(0, BLACK) ;
         drawAxes() ;
+        drawHLine(LEFT_EDGE, BOTTOM_PLOT_BOTTOM - 75, PLOT_WIDTH, WHITE);
 
         start = head;
         for (i = 0; i < PLOT_WIDTH; i++) {
-            // top: measured angle (-90 to +90 degrees)
+            // Top: target and measured angle (0 to 270 degrees).
+            drawPixel(LEFT_EDGE + i,
+                plot_y(fix2float15(target_history[start]),
+                    0.0f, 270.0f, TOP_PLOT_BOTTOM), WHITE);
             drawPixel(
                 LEFT_EDGE + i,
                 plot_y(fix2float15(angle_history[start]),
-                    -90.0f, 90.0f, TOP_PLOT_BOTTOM),
+                    0.0f, 270.0f, TOP_PLOT_BOTTOM),
                 YELLOW
             );
 
-            // bottom: filtered motor command (0 to 6000)
+            // Bottom: motor and signed PID contributions (-6000 to +6000).
             drawPixel(
                 LEFT_EDGE + i,
                 plot_y(motor_history[start],
-                    0.0f, (float)PWM_COUNTS, BOTTOM_PLOT_BOTTOM),
+                    -(float)PWM_COUNTS, (float)PWM_COUNTS, BOTTOM_PLOT_BOTTOM),
                 GREEN
             );
+            drawPixel(LEFT_EDGE + i,
+                plot_y(prop_history[start], -(float)PWM_COUNTS,
+                    (float)PWM_COUNTS, BOTTOM_PLOT_BOTTOM), RED);
+            drawPixel(LEFT_EDGE + i,
+                plot_y(integral_history[start], -(float)PWM_COUNTS,
+                    (float)PWM_COUNTS, BOTTOM_PLOT_BOTTOM), CYAN);
+            drawPixel(LEFT_EDGE + i,
+                plot_y(deriv_history[start], -(float)PWM_COUNTS,
+                    (float)PWM_COUNTS, BOTTOM_PLOT_BOTTOM), MAGENTA);
 
             start = ((start + 1) == PLOT_WIDTH) ? 0 : start + 1;
         }
 
+        // Show the same samples as the rightmost points, refreshed each frame.
+        draw_value("Angle", fix2float15(angle_history[latest]), 130, YELLOW);
+        draw_value("Target", fix2float15(target_history[latest]), 150, WHITE);
+        draw_value("Motor", motor_history[latest], 310, GREEN);
+        draw_value("P", prop_history[latest], 330, RED);
+        draw_value("I", integral_history[latest], 350, CYAN);
+        draw_value("D", deriv_history[latest], 370, MAGENTA);
+
         // Convert the 15.16 fixed-point angle to hundredths of a degree.
-        angle_hundredths = (int)(((signed long long)complementary_angle * 100) >> 16);
+        angle_hundredths = (int)(((signed long long)angle_history[latest] * 100) >> 16);
         angle_magnitude = abs(angle_hundredths);
         snprintf(screentext, sizeof(screentext), "Angle: %s%d.%02d deg",
                  angle_hundredths < 0 ? "-" : "",
