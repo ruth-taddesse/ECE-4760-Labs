@@ -6,6 +6,11 @@
 
 #include "hardware/i2c.h"
 #include "mpu6050.h"
+#include <stdio.h>
+
+// Global tracking variable for the active scaling divisor
+// Defaults to 131.0f (+/- 250 deg/s range)
+static float current_gyro_scale_factor = 131.0f;
 
 void mpu6050_reset() {
     // Two byte reset. First byte register, second byte data
@@ -65,8 +70,51 @@ void mpu6050_read_raw(fix15 accel[3], fix15 gyro[3]) {
 
     for (int i = 0; i < 3; i++) {
         temp_gyro = (buffer[i<<1] << 8 | buffer[(i<<1) + 1]);
-        gyro[i] = temp_gyro ;
-        gyro[i] = multfix15(gyro[i], 500<<16) ; // deg/sec
+        // include set gyro rate
+        gyro[i] = float2fix15(
+            (float)temp_gyro / current_gyro_scale_factor);
     }
 }
+
+bool mpu6050_set_gyro_range(int range_deg_s) {
+    uint8_t config_byte = 0x00;
+    float scale_factor = 131.0f;
+
+    // Map the human-readable integer to the correct register value and scale factor
+    switch (range_deg_s) {
+        case 250:
+            config_byte = 0x00; // Binary 00000000 (FS_SEL = 0)
+            scale_factor = 131.0f;
+            break;
+        case 500:
+            config_byte = 0x08; // Binary 00001000 (FS_SEL = 1)
+            scale_factor = 65.5f;
+            break;
+        case 1000:
+            config_byte = 0x10; // Binary 00010000 (FS_SEL = 2)
+            scale_factor = 32.8f;
+            break;
+        case 2000:
+            config_byte = 0x18; // Binary 00011000 (FS_SEL = 3)
+            scale_factor = 16.4f;
+            break;
+        default:
+            // Return false if an invalid range integer is supplied
+            printf("Error: Invalid gyro range %d. Use 250, 500, 1000, or 2000.\n", range_deg_s);
+            return false;
+    }
+
+    // Write the dynamic byte to the configuration register (0x1B)
+    uint8_t buf[] = {0x1B, config_byte};
+    int result = i2c_write_blocking(I2C_CHAN, ADDRESS, buf, 2, false);
+
+    // If writing over I2C succeeded, update the active global scaling divisor
+    if (result == 2) { // confirms both bytes were written
+        current_gyro_scale_factor = scale_factor;
+        return true;
+    }
+
+    return false;
+}
+
 /////////////////////////////////////////////////////////////////

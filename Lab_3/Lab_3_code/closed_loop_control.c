@@ -100,9 +100,12 @@ static struct pt_sem vga_semaphore ;
 
 volatile fix15 filtered_ax;
 volatile fix15 filtered_az;
-fix15 accel_angle;
+volatile fix15 accel_angle;
 fix15 gyro_angle_delta;
 volatile fix15 complementary_angle;
+// Diagnostic estimates only; the PID continues using complementary_angle.
+volatile float gyro_only_angle = 0.0f;
+volatile float peak_estimated_angle = 0.0f;
 
 // 6000 counter ticks per period: level 6000 = 100%.
 #define PWM_COUNTS 6000
@@ -127,6 +130,8 @@ static float prop_history[PLOT_WIDTH];
 static float integral_history[PLOT_WIDTH];
 static float deriv_history[PLOT_WIDTH];
 static fix15 target_history[PLOT_WIDTH];
+static fix15 accel_angle_history[PLOT_WIDTH];
+static float gyro_only_history[PLOT_WIDTH];
 
 //PID Loop
 volatile fix15 target_angle = int2fix15(110);
@@ -134,9 +139,17 @@ volatile float error;
 volatile float prop;
 volatile float integral;
 volatile float deriv;
-volatile float kp = 75.0f; //inital 27
-volatile float ki = 20.0f;
-volatile float kd = 10.0f;
+// BEST CONSTANTS:
+// quick and adjusts well, but positive overshooting isn't fully reflected in VGA: kp = 100, ki = 100/110, kd = 15
+// avoid gyro capping: kp = 60, ki = 75, kd = 15
+// !!! error only w/accel: 110, 60, 30
+volatile float kp = 110.0f; 
+volatile float ki = 60.0f;
+volatile float kd = 30.0f;
+// Latest signed gyro angular velocity, shared with the VGA thread (deg/s).
+volatile float angular_velocity = 0.0f;
+// Largest angular-speed magnitude observed since startup (deg/s).
+volatile float max_angular_velocity = 0.0f;
 
 
 void drawAxes() {
@@ -164,10 +177,10 @@ void drawAxes() {
     drawHLine(75, 155, 5, CYAN) ;
     drawHLine(75, 80, 5, CYAN) ;
     drawVLine(80, 80, 150, CYAN) ;
-    sprintf(screentext, "135") ;
+    sprintf(screentext, "90") ;
     setCursor(50, 150) ;
     writeString(screentext) ;
-    sprintf(screentext, "270") ;
+    sprintf(screentext, "180") ;
     setCursor(45, 75) ;
     writeString(screentext) ;
     sprintf(screentext, "0") ;
@@ -241,22 +254,43 @@ void on_pwm_wrap() {
     // Gyro angle delta (measurement times timestep) (15.16 fixed point)
     gyro_angle_delta = multfix15(gyro[1], zeropt001) ;
 
+    // Anchor the gyro-only diagnostic at startup and each target change.
+    // Keep it independent of accelerometer corrections during the move.
+    static bool tracker_initialized = false;
+    static fix15 tracker_target;
+    fix15 current_target = target_angle;
+    if (!tracker_initialized || current_target != tracker_target) {
+        gyro_only_angle = fix2float15(complementary_angle);
+        peak_estimated_angle = gyro_only_angle;
+        tracker_target = current_target;
+        tracker_initialized = true;
+    }
+    gyro_only_angle += fix2float15(gyro_angle_delta);
+
     // Complementary angle (degrees - 15.16 fixed point)
     //change to plus becasue of how imu is mounted
-    complementary_angle = multfix15(complementary_angle + gyro_angle_delta, zeropt999) + multfix15(accel_angle, zeropt001);
+    complementary_angle = multfix15(complementary_angle + gyro_angle_delta, zeropt998) + multfix15(accel_angle, zeropt002);
+    float estimated_angle = fix2float15(complementary_angle);
+    if (estimated_angle > peak_estimated_angle) {
+        peak_estimated_angle = estimated_angle;
+    }
 
     // smooth a copy of the motor command for display
     filtered_control += 0.01f * ((float)control - filtered_control);
 
-    // PID LOOP - arbitrary bounds for now
-    error = fix2float15(target_angle - complementary_angle);
-    float angular_velocity = fix2float15(gyro[1]);
+    // PID LOOP
+    error = fix2float15(target_angle - accel_angle);
+    angular_velocity = fix2float15(gyro[1]);
+    float speed = fabsf(angular_velocity);
+    if (speed > max_angular_velocity) {
+        max_angular_velocity = speed;
+    }
 
     prop = kp * error;
     integral += ki * error * 0.001f;
 
-    if (integral > 3000.0f) integral = 3000.0f;
-    if (integral < -3000.0f) integral = -3000.0f;
+    if (integral > 4000.0f) integral = 4000.0f;
+    if (integral < -4000.0f) integral = -4000.0f;
     deriv = -kd * angular_velocity;
 
     int pid_output = prop + integral + deriv;
@@ -300,6 +334,8 @@ static PT_THREAD (protothread_draw(struct pt *pt))
 
         // Sample angle, motor command, and PID terms once per display frame.
         angle_history[head] = complementary_angle;
+        accel_angle_history[head] = accel_angle;
+        gyro_only_history[head] = gyro_only_angle;
         target_history[head] = target_angle;
         motor_history[head] = filtered_control;
         prop_history[head] = prop;
@@ -312,18 +348,28 @@ static PT_THREAD (protothread_draw(struct pt *pt))
         // Clear the buffer, draw the axes
         clearLowFrame(0, BLACK) ;
         drawAxes() ;
+        setCursor(LEFT_EDGE, 40);
+        setTextColor(CYAN); writeString("Accel");
+        setCursor(LEFT_EDGE + 60, 40);
+        setTextColor(MAGENTA); writeString("Gyro-only");
         drawHLine(LEFT_EDGE, BOTTOM_PLOT_BOTTOM - 75, PLOT_WIDTH, WHITE);
 
         start = head;
         for (i = 0; i < PLOT_WIDTH; i++) {
-            // Top: target and measured angle (0 to 270 degrees).
+            drawPixel(LEFT_EDGE + i,
+                plot_y(fix2float15(accel_angle_history[start]),
+                    0.0f, 180.0f, TOP_PLOT_BOTTOM), CYAN);
+            drawPixel(LEFT_EDGE + i,
+                plot_y(gyro_only_history[start],
+                    0.0f, 180.0f, TOP_PLOT_BOTTOM), MAGENTA);
+            // Top: target and measured angle (0 to 180 degrees).
             drawPixel(LEFT_EDGE + i,
                 plot_y(fix2float15(target_history[start]),
-                    0.0f, 270.0f, TOP_PLOT_BOTTOM), WHITE);
+                    0.0f, 180.0f, TOP_PLOT_BOTTOM), WHITE);
             drawPixel(
                 LEFT_EDGE + i,
                 plot_y(fix2float15(angle_history[start]),
-                    0.0f, 270.0f, TOP_PLOT_BOTTOM),
+                    0.0f, 180.0f, TOP_PLOT_BOTTOM),
                 YELLOW
             );
 
@@ -350,6 +396,13 @@ static PT_THREAD (protothread_draw(struct pt *pt))
         // Show the same samples as the rightmost points, refreshed each frame.
         draw_value("Angle", fix2float15(angle_history[latest]), 130, YELLOW);
         draw_value("Target", fix2float15(target_history[latest]), 150, WHITE);
+        setTextColor(CYAN);
+        setCursor(VALUE_X, 175);
+        writeString("Peak speed (deg/s)");
+        draw_value("Max", max_angular_velocity, 190, CYAN);
+        draw_value("Accel", fix2float15(accel_angle_history[latest]), 210, CYAN);
+        draw_value("Gyro", gyro_only_history[latest], 230, MAGENTA);
+        draw_value("Peak", peak_estimated_angle, 250, YELLOW);
         draw_value("Motor", motor_history[latest], 310, GREEN);
         draw_value("P", prop_history[latest], 330, RED);
         draw_value("I", integral_history[latest], 350, CYAN);
@@ -432,7 +485,7 @@ static PT_THREAD (protothread_serial(struct pt *pt))
     PT_YIELD_usec(500000); // slight delay before printing first prompt
     
     while(1) {
-        sprintf(pt_serial_out_buffer, "Enter command (p, i, d, or s for status): ");
+        sprintf(pt_serial_out_buffer, "Enter command (p, i, d, t, or s for status): ");
         printf("%s", pt_serial_out_buffer);
         stdio_flush();
         
@@ -495,14 +548,14 @@ static PT_THREAD (protothread_serial(struct pt *pt))
             stdio_flush();
         }
         else if (classifier == 't' || classifier == 'T') {
-            sprintf(pt_serial_out_buffer, "New Target Angle:");
+            sprintf(pt_serial_out_buffer, "New Target Angle: ");
             printf("%s", pt_serial_out_buffer);
             stdio_flush();
             PT_SPAWN(pt, &usb_read_pt, protothread_usb_read(&usb_read_pt));
             if (sscanf(pt_serial_in_buffer, "%f", &float_in) == 1 &&
                 isfinite(float_in) && float_in >= 0.0f) {
-                target_angle = float_in;
-                printf("-> Target angle updated to %f\r\n", target_angle);
+                target_angle = float2fix15(float_in);
+                printf("-> Target angle updated to %f\r\n", fix2float15(target_angle));
             } else {
                 printf("Invalid target angle; value is unchanged\r\n");
             }
@@ -541,6 +594,7 @@ int main() {
     // MPU6050 initialization
     mpu6050_reset();
     mpu6050_read_raw(acceleration, gyro);
+    mpu6050_set_gyro_range(1000);
 
     filtered_ax = acceleration[0];
     filtered_az = acceleration[2];  
