@@ -117,6 +117,14 @@ volatile float peak_estimated_angle = 0.0f;
 // GPIO we're using for PWM
 #define PWM_OUT 4
 
+// Normally-open buttons between these GPIOs and GND (internal pull-ups).
+#define STEP_BUTTON_PIN 6
+#define SINE_BUTTON_PIN 7
+#define BUTTON_SCAN_US 20000u
+#define HORIZONTAL_DEG 90.0f
+#define SINE_AMPLITUDE_DEG 30.0f
+#define SINE_PERIOD_US 10000000ull
+
 // Variable to hold PWM slice number
 uint slice_num ;
 
@@ -143,13 +151,101 @@ volatile float deriv;
 // quick and adjusts well, but positive overshooting isn't fully reflected in VGA: kp = 100, ki = 100/110, kd = 15
 // avoid gyro capping: kp = 60, ki = 75, kd = 15
 // !!! error only w/accel: 110, 60, 30
-volatile float kp = 110.0f; 
-volatile float ki = 60.0f;
+volatile float kp = 130.0f; 
+volatile float ki = 70.0f;
 volatile float kd = 30.0f;
 // Latest signed gyro angular velocity, shared with the VGA thread (deg/s).
 volatile float angular_velocity = 0.0f;
 // Largest angular-speed magnitude observed since startup (deg/s).
 volatile float max_angular_velocity = 0.0f;
+
+// Sequence modes: 0 = manual target, 1 = timed steps, 2 = sine wave.
+static volatile int sequence_mode = 0;
+static volatile bool sequence_held = false;
+static int pending_sequence = 1;
+static uint64_t sequence_start_us;
+
+// GPIO interrupts capture raw levels; the PWM ISR scans them every 20 ms.
+// One independent copy of the diagram's machine per button:
+// 0 = Not pressed, 1 = Maybe pressed, 2 = Pressed,
+// 3 = Maybe not pressed. For a single button, keycode == possible means down.
+static volatile bool button_down[2];
+static int button_state[2] = {0, 0};
+static bool button_pressed[2] = {false, false};
+static uint64_t last_button_scan_us;
+
+static void button_callback(uint gpio, uint32_t events) {
+    if (!(events & (GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE))) return;
+    if (gpio == STEP_BUTTON_PIN) button_down[0] = !gpio_get(gpio);
+    else if (gpio == SINE_BUTTON_PIN) button_down[1] = !gpio_get(gpio);
+}
+
+static void debounce_button(int index, bool down) {
+    switch (button_state[index]) {
+        case 0: //not pressed: no key -> stay; key -> Maybe pressed.
+            if (down) button_state[index] = 1;
+            break;
+        case 1: //maybe pressed: matching key -> Pressed, TAKE AN ACTION.
+            if (down) {
+                button_state[index] = 2;
+                button_pressed[index] = true;
+            } else {
+                button_state[index] = 0;
+            }
+            break;
+        case 2: //pressed: matching key -> stay; no key -> Maybe not pressed.
+            if (!down) button_state[index] = 3;
+            break;
+        case 3: //maybe not pressed: matching key -> Pressed; no key -> idle.
+            if (down) {
+                button_state[index] = 2;
+            } else {
+                button_state[index] = 0;
+                button_pressed[index] = false;
+            }
+            break;
+    }
+}
+
+// Called only by the PWM ISR. Act on debounced states, never raw edges.
+// A confirmed press holds the motor off until both buttons confirm release.
+static bool update_sequence(uint64_t now_us) {
+    if (now_us - last_button_scan_us >= BUTTON_SCAN_US) {
+        last_button_scan_us = now_us;
+        debounce_button(0, button_down[0]);
+        debounce_button(1, button_down[1]);
+    }
+    bool step_pressed = button_pressed[0];
+    bool sine_pressed = button_pressed[1];
+    if (step_pressed || sine_pressed) {
+        // Steps take priority when both buttons are confirmed down.
+        pending_sequence = step_pressed ? 1 : 2;
+        sequence_held = true;
+        target_angle = int2fix15(0); // Hanging down; motor is disabled below.
+        return true;
+    }
+    if (sequence_held) {
+        sequence_held = false;
+        sequence_mode = pending_sequence;
+        sequence_start_us = now_us; // t = 0 at the confirmed release.
+    }
+
+    uint64_t elapsed_us = now_us - sequence_start_us;
+    if (sequence_mode == 1) {
+        float degrees = HORIZONTAL_DEG;
+        if (elapsed_us >= 5000000ull && elapsed_us < 10000000ull)
+            degrees += 30.0f;
+        else if (elapsed_us >= 10000000ull && elapsed_us < 15000000ull)
+            degrees -= 30.0f;
+        target_angle = float2fix15(degrees);
+    } else if (sequence_mode == 2) {
+        // Reduce the phase before converting to float to avoid long-run drift.
+        float phase = (float)(elapsed_us % SINE_PERIOD_US) / (float)SINE_PERIOD_US;
+        target_angle = float2fix15(HORIZONTAL_DEG + SINE_AMPLITUDE_DEG *
+                                  sinf(2.0f * (float)PI * phase));
+    }
+    return false;
+}
 
 
 void drawAxes() {
@@ -235,6 +331,15 @@ void on_pwm_wrap() {
     
     gpio_put(14, !gpio_get(14)) ;
 
+    bool motor_disabled = update_sequence(time_us_64());
+    if (motor_disabled) {
+        // Apply zero duty before the IMU read, and prevent integral windup.
+        control = old_control = 0;
+        prop = integral = deriv = 0.0f;
+        filtered_control = 0.0f;
+        pwm_set_chan_level(slice_num, PWM_CHAN_A, 0);
+    }
+
     // Read the IMU
     // NOTE! This is in 15.16 fixed point. Accel in g's, gyro in deg/s
     // If you want these values in floating point, call fix2float15() on
@@ -259,7 +364,8 @@ void on_pwm_wrap() {
     static bool tracker_initialized = false;
     static fix15 tracker_target;
     fix15 current_target = target_angle;
-    if (!tracker_initialized || current_target != tracker_target) {
+    if (!tracker_initialized || motor_disabled ||
+        (sequence_mode != 2 && current_target != tracker_target)) {
         gyro_only_angle = fix2float15(complementary_angle);
         peak_estimated_angle = gyro_only_angle;
         tracker_target = current_target;
@@ -286,17 +392,20 @@ void on_pwm_wrap() {
         max_angular_velocity = speed;
     }
 
+    // Keep sensing and drawing while held, but do not run the motor PID.
+    if (motor_disabled) return;
+
     prop = kp * error;
     integral += ki * error * 0.001f;
 
-    if (integral > 4000.0f) integral = 4000.0f;
-    if (integral < -4000.0f) integral = -4000.0f;
+    if (integral > 5000.0f) integral = 5000.0f;
+    if (integral < -5000.0f) integral = -5000.0f;
     deriv = -kd * angular_velocity;
 
     int pid_output = prop + integral + deriv;
 
-    if (pid_output > 4000) {
-        pid_output = 4000;
+    if (pid_output > 5000) {
+        pid_output = 5000;
     }
     else if (pid_output < 0) {
         pid_output = 0;
@@ -348,6 +457,11 @@ static PT_THREAD (protothread_draw(struct pt *pt))
         // Clear the buffer, draw the axes
         clearLowFrame(0, BLACK) ;
         drawAxes() ;
+        setCursor(LEFT_EDGE, 10);
+        setTextColor(WHITE);
+        writeString(sequence_held ? "HELD: motor off" :
+                    sequence_mode == 1 ? "STEP sequence" :
+                    sequence_mode == 2 ? "SINE sequence" : "Manual target");
         setCursor(LEFT_EDGE, 40);
         setTextColor(CYAN); writeString("Accel");
         setCursor(LEFT_EDGE + 60, 40);
@@ -394,7 +508,7 @@ static PT_THREAD (protothread_draw(struct pt *pt))
         }
 
         // Show the same samples as the rightmost points, refreshed each frame.
-        draw_value("Angle", fix2float15(angle_history[latest]), 130, YELLOW);
+        draw_value("Angle", fix2float15(accel_angle_history[latest]), 130, YELLOW);
         draw_value("Target", fix2float15(target_history[latest]), 150, WHITE);
         setTextColor(CYAN);
         setCursor(VALUE_X, 175);
@@ -554,7 +668,12 @@ static PT_THREAD (protothread_serial(struct pt *pt))
             PT_SPAWN(pt, &usb_read_pt, protothread_usb_read(&usb_read_pt));
             if (sscanf(pt_serial_in_buffer, "%f", &float_in) == 1 &&
                 isfinite(float_in) && float_in >= 0.0f) {
+                // Change mode and target atomically with respect to the ISR.
+                uint32_t irq_state = save_and_disable_interrupts();
+                sequence_mode = 0;
+                sequence_held = false;
                 target_angle = float2fix15(float_in);
+                restore_interrupts(irq_state);
                 printf("-> Target angle updated to %f\r\n", fix2float15(target_angle));
             } else {
                 printf("Invalid target angle; value is unchanged\r\n");
@@ -581,6 +700,22 @@ int main() {
 
     // Initialize stdio
     stdio_init_all();
+
+    gpio_init(STEP_BUTTON_PIN);
+    gpio_set_dir(STEP_BUTTON_PIN, GPIO_IN);
+    gpio_pull_up(STEP_BUTTON_PIN);
+    gpio_init(SINE_BUTTON_PIN);
+    gpio_set_dir(SINE_BUTTON_PIN, GPIO_IN);
+    gpio_pull_up(SINE_BUTTON_PIN);
+    gpio_set_irq_enabled_with_callback(STEP_BUTTON_PIN,
+        GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE, true, button_callback);
+    gpio_set_irq_enabled(SINE_BUTTON_PIN,
+        GPIO_IRQ_EDGE_FALL | GPIO_IRQ_EDGE_RISE, true);
+    // Seed levels so a button held during startup also enters the machine.
+    uint32_t button_irq_state = save_and_disable_interrupts();
+    button_down[0] = !gpio_get(STEP_BUTTON_PIN);
+    button_down[1] = !gpio_get(SINE_BUTTON_PIN);
+    restore_interrupts(button_irq_state);
 
     // Initialize VGA
     initVGA() ;
