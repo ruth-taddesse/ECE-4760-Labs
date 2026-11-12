@@ -1,0 +1,8 @@
+build
+build_training/
+__pycache__/
+throw_data/
+data/
+analysis/
+.venv/
+!.vscode/*
