@@ -19,7 +19,7 @@ enum { HOME_VIEW, GAME_VIEW, SETTINGS_VIEW, UNAVAILABLE_VIEW, QUIT_VIEW };
 typedef struct {
     int state,view,return_view;unsigned menu_index,unavailable_game;
     unsigned countdown,phase,errors,missed,rail,samples;
-    bool sensor_ok,is_calibrated;
+    bool sensor_ok,is_calibrated,wireless_connected;
     bool has_shot;
     BowlTuning tuning;BowlThrow shot;BowlPath path;uint64_t animation_start;
 } Demo;
@@ -42,23 +42,44 @@ static uint64_t joystick_last,button_changed,menu_repeat;
 static bool button_raw,button_stable;
 static int menu_direction;
 static void command(const char *line);
+#ifdef SPORTS_WIRELESS_GROUND
+#include "wireless/radio.h"
+static void replay(void);
+#include "wireless/ground.inc"
+#endif
 static float joystick_axis(unsigned channel){
+#ifdef SPORTS_WIRELESS_GROUND
+    return (channel==0?remote_packet.joy_x:remote_packet.joy_y)-JOY_CENTER;
+#else
     adc_select_input(channel);(void)adc_read(); // discard first sample after switching
     unsigned sum=0;for(int i=0;i<8;i++)sum+=adc_read();
     return sum/8.0f-JOY_CENTER;
+#endif
 }
 static void update_joystick(uint64_t now) {
     if(now-joystick_last<10000)return;
     float dt=fminf((now-joystick_last)*1e-6f,0.02f);
     joystick_last=now;
+#ifdef SPORTS_WIRELESS_GROUND
+    if(!remote_connected)return;
+    bool select=remote_press;remote_press=false;
+#else
     bool pressed=!gpio_get(JOY_SW);
     if(pressed!=button_raw){button_raw=pressed;button_changed=now;}
     bool select=false;
     if(now-button_changed>=30000 && button_stable!=button_raw){
         button_stable=button_raw;select=button_stable;
     }
+    #endif
     // Selection is menu-only: never accidentally start/cancel a throw by gripping SW.
     if(select){
+#ifdef SPORTS_WIRELESS_GROUND
+        if(demo.view==GAME_VIEW){
+            if(demo.state==NEED_CAL)command("CAL");
+            else if(demo.state==READY||demo.state==BAD_CAPTURE||demo.state==PLAYING)command("THROW");
+            return;
+        }
+#endif
         if(demo.view==HOME_VIEW||demo.view==UNAVAILABLE_VIEW||demo.view==QUIT_VIEW){command("");return;}
         if(demo.view==SETTINGS_VIEW){command("BACK");return;}
     }
@@ -226,7 +247,12 @@ static void draw_game(const Demo *d){
         case SENSOR_ERROR:status="CHECK IMU WIRING";color=RED;break;
     }
     title(24,52,color,status);
-    label(26,84,BLACK,d->state==NEED_CAL?"Place sensor flat, +Z up. Type CAL and press Enter.":
+    label(26,84,BLACK,d->state==NEED_CAL?
+#ifdef SPORTS_WIRELESS_GROUND
+          "Place controller +Z up. Click SW, then keep still.":
+#else
+          "Place sensor flat, +Z up. Type CAL and press Enter.":
+#endif
           d->state==CALIBRATING?"Leave the controller still for three seconds.":
           d->state==BAD_CAPTURE?"Weak or incomplete capture. Press Enter to retry.":
           d->state==SENSOR_ERROR?"Check 3.3V, GND, GP8 SDA / GP9 SCL; reboot.":
@@ -301,13 +327,38 @@ static void draw_game(const Demo *d){
     label(14,460-BOTTOM_SAFE_MARGIN,BLUE,"First contact only / pin scattering and scoring pending");
 }
 static void draw_core(void){
+#ifdef SPORTS_WIRELESS_GROUND
+    uint64_t rendered_at=0;bool rendered=false,was_animating=false;
+#endif
     while(true){
         if(!draw_start_signal()){tight_loop_contents();continue;}
+#ifdef SPORTS_WIRELESS_GROUND
+        uint64_t frame_now=time_us_64();
+        if(rendered&&frame_now-rendered_at<33333)continue;
+        mutex_enter_blocking(&lock);
+        bool changed=!rendered||memcmp(&screen,&demo,sizeof(screen))!=0;
+        memcpy(&screen,&demo,sizeof(screen));mutex_exit(&lock);
+        bool animating=screen.has_shot&&screen.path.count&&
+            (frame_now-screen.animation_start)*1e-6f<screen.path.points[screen.path.count-1].t;
+        if(!changed&&!animating&&!was_animating)continue;
+        was_animating=animating;rendered=true;rendered_at=frame_now;
+#else
         mutex_enter_blocking(&lock);memcpy(&screen,&demo,sizeof(screen));mutex_exit(&lock);
+#endif
         if(screen.view==GAME_VIEW)draw_game(&screen);else draw_menu(&screen);
+#ifdef SPORTS_WIRELESS_GROUND
+        fillRect(0,460,640,20,WHITE);
+        label(14,462,screen.wireless_connected?BLUE:RED,screen.wireless_connected?
+            "Wi-Fi linked / SW: select or bowl / hold SW: menu":
+            "Waiting for controller / power on handheld Pico W");
+#endif
     }
 }
 static void help(void){
+#ifdef SPORTS_WIRELESS_GROUND
+    puts("# SPORTS_GROUND / Pico W / Wi-Fi AP PicoSports. Handheld joins automatically.");
+    puts("# Short SW: select, calibrate, or bowl. Hold SW 1s: menu/cancel. Watch VGA cues.");
+#endif
     puts("# PICO SPORTS: USB terminal controls the VGA menus. W/S then Enter, or 1-5.");
     puts("# 1 BOWLING | 2 BASKETBALL (coming soon) | 3 CUP PONG (coming soon) | 4 SETTINGS | 5 QUIT");
     puts("# MENU: game menu | BACK: previous screen | SETTINGS: tuning | QUIT: stop session");
@@ -338,6 +389,9 @@ static void command(const char *input){
     bool quit=!strcmp(line,"QUIT")||!strcmp(line,"Q")||!strcmp(line,"5");
     bool settings=!strcmp(line,"SETTINGS")||(!busy&&!strcmp(line,"4"));
     if(home||quit||settings||!strcmp(line,"BACK")){
+#ifdef SPORTS_WIRELESS_GROUND
+        if(busy)remote_request_op(OP_STOP);
+#endif
         mutex_enter_blocking(&lock);
         if(busy){demo.state=calibrated?READY:NEED_CAL;demo.has_shot=false;}
         if(settings){demo.return_view=demo.view==GAME_VIEW?GAME_VIEW:HOME_VIEW;demo.view=SETTINGS_VIEW;}
@@ -347,6 +401,9 @@ static void command(const char *input){
     }
     if(busy){
         if(!strcmp(line,"STOP")){
+#ifdef SPORTS_WIRELESS_GROUND
+            remote_request_op(OP_STOP);
+#endif
             mutex_enter_blocking(&lock);demo.state=READY;mutex_exit(&lock);
             puts("OK,capture_cancelled");
         }
@@ -376,10 +433,14 @@ static void command(const char *input){
     if(!strcmp(line,"CAL")) {
         if(!healthy){puts("ERR,sensor");return;}
         mutex_enter_blocking(&lock);demo.view=GAME_VIEW;demo.state=CALIBRATING;demo.has_shot=false;demo.is_calibrated=false;mutex_exit(&lock);
+#ifdef SPORTS_WIRELESS_GROUND
+        remote_request_op(OP_CAL);puts("ACK,CAL - Keep controller +Z up and still; watch VGA.");return;
+#else
         calibrated=imu_calibrate(&bias);
         mutex_enter_blocking(&lock);demo.is_calibrated=calibrated;demo.state=calibrated?READY:NEED_CAL;mutex_exit(&lock);
         if(calibrated)puts("CAL,OK - Press Enter to record a throw.");
         else printf("ERR,%s\n",imu_calibration_report());
+#endif
         return;
     }
     if(!line[0]||!strcmp(line,"THROW")) {
@@ -391,7 +452,12 @@ static void command(const char *input){
         demo.state=COUNTDOWN;demo.countdown=3;
         mutex_exit(&lock);
         puts("ACK,THROW - Watch VGA. Countdown 3s, hold still 0.5s, then THROW NOW.");stdio_flush();
-        countdown_end=time_us_64()+3000000;return;
+#ifdef SPORTS_WIRELESS_GROUND
+        remote_request_op(OP_THROW);
+#else
+        countdown_end=time_us_64()+3000000;
+#endif
+        return;
     }
     char key[32],extra;float value;
     bool set=sscanf(line,"SET %31s %f %c",key,&value,&extra)==2;
@@ -407,10 +473,18 @@ static void command(const char *input){
 }
 int main(void) {
     set_sys_clock_khz(150000,true);stdio_init_all();mutex_init(&lock);initVGA();
+#ifndef SPORTS_WIRELESS_GROUND
     adc_init();adc_gpio_init(26);adc_gpio_init(27);
     gpio_init(JOY_SW);gpio_set_dir(JOY_SW,GPIO_IN);gpio_pull_up(JOY_SW);
+#endif
     joystick_last=time_us_64();
-    healthy=imu_init();demo.sensor_ok=healthy;demo.view=HOME_VIEW;demo.state=healthy?NEED_CAL:SENSOR_ERROR;demo.tuning=bowl_defaults();
+#ifdef SPORTS_WIRELESS_GROUND
+    if(!radio_init(true))panic("Ground Wi-Fi init failed");
+    healthy=false;
+#else
+    healthy=imu_init();
+#endif
+    demo.sensor_ok=healthy;demo.view=HOME_VIEW;demo.state=healthy?NEED_CAL:SENSOR_ERROR;demo.tuning=bowl_defaults();
     multicore_launch_core1(draw_core);
     char input[128];unsigned used=0;bool overflow=false,last_cr=false,connected_before=false,pending=false;
     while(true) {
@@ -427,6 +501,9 @@ int main(void) {
             else overflow=true;
         }
         uint64_t now=time_us_64();
+#ifdef SPORTS_WIRELESS_GROUND
+        remote_tick();update_joystick(time_us_64());sleep_us(500);continue;
+#else
         update_joystick(now);
         mutex_enter_blocking(&lock);
         if(demo.state==COUNTDOWN) {
@@ -458,5 +535,6 @@ int main(void) {
             for(int j=0;j<3;j++){r.a[j]-=bias.a[j];r.g[j]-=bias.g[j];}
             bowl_features_add(&features,r.a,r.g,(float)elapsed/1000000.0f);
         }
+#endif
     }
 }

@@ -1,4 +1,4 @@
-"""USB terminal for BOWLING_DEMO.uf2; the Pico runs capture, classification and physics."""
+"""USB terminal for wired BOWLING_DEMO or wireless SPORTS_GROUND firmware."""
 import argparse
 import time
 import serial
@@ -13,7 +13,7 @@ def main():
     if not args.port:
         for p in list_ports.comports():print(p.device,p.description)
         args.port=input('Pico port: ').strip()
-    print('Close the Serial Monitor before continuing. Flash build/BOWLING_DEMO.uf2.')
+    print('Close Serial Monitor. Use the game board USB port (ground station for the wireless pair).')
     with serial.Serial(args.port,115200,timeout=.1,write_timeout=2) as device:
         device.dtr=True
         device.write(b'STOP\n')
@@ -51,7 +51,9 @@ def main():
                     if reply.startswith('ERR,'):raise ValueError(reply)
                     if reply.startswith(('OK,','ACK,','CAL,','BOWL,')):break
                 print(reply)
-                if reply.startswith('ACK,'):
+                if reply.startswith('ACK,CAL'):
+                    print(','.join(link.response('CAL,',8)))
+                elif reply.startswith('ACK,'):
                     print(','.join(link.response('RESULT,',12)))
                     print('Watch the VGA ball trail; Enter bowls again, MENU returns.')
                 if command in ('QUIT','5'):return

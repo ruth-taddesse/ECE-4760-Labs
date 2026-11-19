@@ -1,5 +1,7 @@
 # Pico Sports menu and player-view bowling prototype
 
+For the two **original Pico W** controller/ground-station system, use [WIRELESS_SETUP.md](WIRELESS_SETUP.md) and the `SPORTS_GROUND` / `SPORTS_CONTROLLER` UF2s. The instructions below describe the original wired Pico 2 demo.
+
 This separate firmware starts at a game-selection menu and draws bowling from
 the player's position at the foul line. The lane converges into the distance;
 the ten pins and animated ball use the same perspective projection. A persistent

@@ -83,7 +83,11 @@ DrawPixel is faster
 //Double-buffered!
 //Turn off second buffer to save memory on RP2040.
 // =============================
+#ifdef SPORTS_SINGLE_BUFFER
+#define DOUBLE_BUFFER_NONE
+#else
 #define DOUBLE_BUFFER_60
+#endif
 //#define DOUBLE_BUFFER_30
 //#define DOUBLE_BUFFER_NONE
 // !!!~=========================!!!

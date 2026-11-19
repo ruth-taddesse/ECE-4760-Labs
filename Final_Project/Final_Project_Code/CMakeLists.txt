@@ -26,6 +26,9 @@ project(MPU6050_IMU C CXX ASM)
 # initialize the sdk
 pico_sdk_init()
 
+if(PICO_BOARD STREQUAL "pico_w")
+    include(${CMAKE_CURRENT_LIST_DIR}/wireless/targets.cmake)
+else()
 add_executable(MPU6050_IMU)
 
 # must match with pio filename and executable name from above
@@ -71,3 +74,5 @@ target_link_libraries(BOWLING_DEMO pico_stdlib pico_bootsel_via_double_reset
 pico_enable_stdio_usb(BOWLING_DEMO 1)
 pico_enable_stdio_uart(BOWLING_DEMO 0)
 pico_add_extra_outputs(BOWLING_DEMO)
+
+endif()

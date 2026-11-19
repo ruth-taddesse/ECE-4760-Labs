@@ -7,3 +7,4 @@ analysis/
 .venv/
 !.vscode/*
 VGA_Previews
+build_wireless/

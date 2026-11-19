@@ -1,0 +1,8 @@
+#ifndef SPORTS_WIFI_CONFIG_H
+#define SPORTS_WIFI_CONFIG_H
+#define SPORTS_WIFI_SSID "PicoSports"
+#define SPORTS_WIFI_PASSWORD "picosports4760"
+#define SPORTS_UDP_PORT 4760
+#define SPORTS_GROUND_IP "192.168.4.1"
+#define SPORTS_CONTROLLER_IP "192.168.4.2"
+#endif
