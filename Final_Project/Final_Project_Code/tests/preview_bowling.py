@@ -13,6 +13,7 @@ from PIL import Image, ImageDraw
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / 'build/bowling_ui'
+WIDE = OUT / 'monitor_16x9'
 SCENES = [
     ('01_game_menu', 0, 1, 0, 0),
     ('02_calibrate', 1, 0, 0, 0),
@@ -34,6 +35,7 @@ SCENES = [
 
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
+    WIDE.mkdir(exist_ok=True)
     # Keep the existing test adapter's expected path; ctypes loads native binaries
     # by content, so the .dll suffix also works on macOS/Linux.
     library = ROOT / 'build/bowling_native.dll'
@@ -69,12 +71,18 @@ def main():
         frame.putpalette(palette)
         frame = frame.convert('RGB')
         frame.save(OUT / (name + '.png'))
+        # The Dell monitor's Fill/16:9 mode stretches the 640x480 signal to
+        # square-looking 16:9 output. Nearest-neighbor preserves VGA pixels.
+        frame.resize((854, 480), Image.Resampling.NEAREST).save(WIDE / (name + '.png'))
         x, y = index % 3 * 640, index // 3 * 504
         draw.text((x + 12, y + 6), name.replace('_', ' '), fill='white')
         sheet.paste(frame, (x, y + 24))
     sheet.save(OUT / 'all_states.png')
+    wide_sheet = sheet.resize((2562, 2520), Image.Resampling.NEAREST)
+    wide_sheet.save(WIDE / 'all_states.png')
     print(f'Navigation passed; rendered {len(SCENES)} states within 640x480.')
     print(OUT / 'all_states.png')
+    print(WIDE / 'all_states.png')
 
 
 if __name__ == '__main__':
