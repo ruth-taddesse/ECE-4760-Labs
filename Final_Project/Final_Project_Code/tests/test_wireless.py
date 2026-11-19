@@ -27,4 +27,6 @@ class WirelessTests(unittest.TestCase):
         self.assertFalse(lib.wire_newer(1,2));self.assertTrue(lib.wire_newer(0,0xffffffff))
     def test_ground_state_recovery(self):
         self.assertEqual(lib.test_remote(),0)
+    def test_joystick_without_imu_and_after_disconnect(self):
+        self.assertEqual(lib.test_remote_joystick_without_imu(),0)
 if __name__=='__main__':unittest.main()

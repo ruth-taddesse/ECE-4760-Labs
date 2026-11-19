@@ -2,7 +2,7 @@
  * Hunter Adams (vha3@cornell.edu)
  * modifed for 16 colors by BRL4
  * 
- *rp2350 ONLY -- too much memory for rp2040
+ * RP2040 uses one framebuffer; RP2350 supports double buffering.
 
  * HARDWARE CONNECTIONS
  *  - GPIO 16 ---> VGA Hsync
@@ -16,7 +16,7 @@
  * RESOURCES USED
  *  - PIO state machines 0, 1, and 2 on PIO instance 0
  *  - 4 DMA channels 
- *  - 2 x 153.6 kBytes of RAM (for doublebuffer pixel color data)
+ *  - 153.6 kBytes of RAM per framebuffer (one on RP2040, two on RP2350)
  *
  */
 

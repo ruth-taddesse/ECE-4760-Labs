@@ -83,7 +83,7 @@ DrawPixel is faster
 //Double-buffered!
 //Turn off second buffer to save memory on RP2040.
 // =============================
-#ifdef SPORTS_SINGLE_BUFFER
+#if defined(SPORTS_SINGLE_BUFFER) || (defined(PICO_RP2040) && PICO_RP2040)
 #define DOUBLE_BUFFER_NONE
 #else
 #define DOUBLE_BUFFER_60
@@ -117,7 +117,7 @@ char * pointer_display_buffer[4] __attribute__ ((aligned (16)));
 int    start_flag_array[4] __attribute__ ((aligned (16)));
 
 // DMA sets this when it is time to draw
-int start_flag = 0 ;
+volatile int start_flag = 0 ;
 // used to signal buffer type to thread
 int buffer_type ;
 
@@ -1316,7 +1316,8 @@ void clearRegion(short y1, short y2, short c) {
 // driver communication with thread
 // draw-sync signal to thread -- clears the flag!
 int draw_start_signal(void){
-  if(start_flag==1) {
+  // DMA signals 1 (60 fps), 2 (30 fps), or 3 (single buffer).
+  if(start_flag!=0) {
     start_flag = 0 ;
     return 1 ;
   }

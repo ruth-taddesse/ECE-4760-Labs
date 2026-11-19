@@ -53,8 +53,10 @@ Pico SDK tools already installed under your user profile.
    **Waiting for controller** means no recent valid controller packets have arrived.
 
 Upload one board at a time so you can identify the intended BOOTSEL drive.
-The old **Run Bowling Demo (USB)** task flashes the wired demo and is not the
-wireless upload task. Building does not automatically flash either board.
+The **Run Project** task builds the pair and uploads `SPORTS_GROUND.uf2` to the
+connected VGA board. **Run Wireless Controller** uploads `SPORTS_CONTROLLER.uf2`
+to the connected handheld. Connect only the intended board when using these tasks.
+Building alone does not flash either board.
 
 ## Play without a computer
 
@@ -108,6 +110,7 @@ SET start_x -0.5
 REPLAY
 RESET
 INFO
+DIAG
 ```
 
 `CAL` and `THROW` are sent over UDP; their completion is asynchronous. Enter also
@@ -116,6 +119,35 @@ format for host compatibility. The existing `host/play_bowling.py --port COMx`
 terminal can be used on the **ground station's COM port** after closing Serial
 Monitor. A controller USB port does not accept game commands. The game does not
 save or modify the training CSV files.
+
+### Joystick/link troubleshooting
+
+`SPORTS_GROUND` reads the joystick from the handheld's packets, not from its own
+ADC pins. A joystick wired to the VGA board will not control this wireless build.
+The handheld must run `SPORTS_CONTROLLER.uf2`. An absent IMU does not prevent
+wireless menu navigation; calibration and throwing still require the IMU.
+
+On the ground station, enter `DIAG` in Serial Monitor. `rx_ok` counts accepted
+packets, `rejected` counts packets with the wrong sender/port/format, and `stale`
+counts duplicates or old sessions. `rx_age_ms=-1` means none has been accepted.
+The `REMOTE` line shows the last accepted X/Y and button counters; these readings
+are historical when `connected=0`. `tx_ok` means the network stack accepted a
+send; it does not prove delivery to the other board.
+
+The handheld prints diagnostics every two seconds while USB serial is connected:
+
+- Wi-Fi state `1` means joined; `-2` means AP not found; `-3` means authentication
+  failure. The Wi-Fi state field is for the station interface; ignore it on the AP.
+- Its IP should be `192.168.4.2`; the ground station should be `192.168.4.1`.
+- X/Y should be near 2048 at rest and change toward 0/4095 as the stick moves.
+  `sw` is 1 while pressed; `clicks` increments on release and `holds` after one second.
+- Changing handheld X/Y but no ground packets points toward the link or firmware
+  roles. A linked pair with unchanging handheld X/Y points toward ADC wiring/input.
+
+Without hardware, run `python3 tests/run_wireless_tests.py` (requires a host C
+compiler). It checks packet validation/order, command acknowledgements, reconnects,
+all four joystick directions and selection without an IMU, ignoring input after
+disconnect, and VGA frame signals. It does not simulate RF, ADC voltages, or wiring.
 
 ## What happens over UDP
 

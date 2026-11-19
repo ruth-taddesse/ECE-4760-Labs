@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "pico/stdlib.h"
+#include "pico/stdio_usb.h"
 #include "pico/multicore.h"
 #include "pico/mutex.h"
 #include "hardware/adc.h"
@@ -76,7 +77,7 @@ int main(void){
     adc_init();adc_gpio_init(26);adc_gpio_init(27);gpio_init(28);gpio_set_dir(28,GPIO_IN);gpio_pull_up(28);
     if(!radio_init(false))panic("Controller Wi-Fi init failed");
     shared.session=radio_session();multicore_launch_core1(worker);
-    uint64_t send_at=0,changed=0,down_at=0;bool raw=false,stable=false,long_sent=false;
+    uint64_t send_at=0,changed=0,down_at=0,debug_at=0;bool raw=false,stable=false,long_sent=false;
     uint32_t peer_seq=0,peer=0;
     for(;;){
         radio_poll();uint64_t now=time_us_64();WirePacket cmd;
@@ -106,6 +107,15 @@ int main(void){
             unsigned x=axis(0),y=axis(1);WirePacket packet;
             mutex_enter_blocking(&guard);shared.joy_x=x;shared.joy_y=y;shared.sequence++;packet=shared;mutex_exit(&guard);
             radio_send(&packet);send_at=now+20000;
+        }
+        if(now>=debug_at&&stdio_usb_connected()){
+            radio_debug_print();
+            mutex_enter_blocking(&guard);WirePacket snapshot=shared;mutex_exit(&guard);
+            printf("# INPUT x=%lu y=%lu sw=%u clicks=%lu holds=%lu imu=%lu calibrated=%lu\n",
+                   (unsigned long)snapshot.joy_x,(unsigned long)snapshot.joy_y,pressed,
+                   (unsigned long)snapshot.select_count,(unsigned long)snapshot.menu_count,
+                   (unsigned long)snapshot.healthy,(unsigned long)snapshot.calibrated);
+            debug_at=now+2000000;
         }
         sleep_us(500);
     }

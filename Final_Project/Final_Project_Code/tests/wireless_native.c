@@ -7,6 +7,7 @@ void panic(const char *fmt,...){(void)fmt;abort();}
 bool radio_init(bool ground){(void)ground;return true;}
 void radio_poll(void){}
 uint32_t radio_session(void){return 123;}
+void radio_debug_print(void){}
 bool radio_take(WirePacket *p){if(!queued_ready)return false;*p=queued;queued_ready=false;return true;}
 void radio_send(const WirePacket *p){sent=*p;}
 static void deliver(WirePacket *p,uint64_t now){queued=*p;queued_ready=true;mock_time=now;remote_tick();}
@@ -48,5 +49,37 @@ int test_remote(void){
     deliver(&p,1520000);if(demo.state!=CALIBRATING||!remote_acked)return 14;
     p.sequence++;p.state=READY;p.calibrated=1;deliver(&p,1540000);
     if(demo.state!=READY||!calibrated||remote_applied!=p.request)return 15;
+    return 0;
+}
+int test_remote_joystick_without_imu(void){
+    memset(&demo,0,sizeof(demo));demo.tuning=bowl_defaults();demo.view=HOME_VIEW;
+    remote_connected=false;remote_session=0;remote_request=1;remote_send_at=0;remote_press=false;
+    joystick_last=menu_repeat=0;menu_direction=0;
+    WirePacket p={0};p.magic=WIRE_MAGIC;p.version=WIRE_VERSION;p.kind=WIRE_STATUS;
+    p.session=99;p.state=SENSOR_ERROR;p.joy_x=p.joy_y=2048;
+    uint64_t now=2000000;
+    deliver(&p,now);update_joystick(now);
+    // Missing IMU must not gate menu input. Exercise all four directions.
+    const unsigned moves[][3]={
+        {4095,2048,1},{2048,2048,1},{0,2048,0},{2048,2048,0},
+        {2048,0,3},{2048,2048,3},{2048,4095,0},{2200,1900,0}
+    };
+    for(unsigned i=0;i<sizeof(moves)/sizeof(moves[0]);i++){
+        p.joy_x=moves[i][0];p.joy_y=moves[i][1];p.sequence++;
+        now+=20000;deliver(&p,now);update_joystick(now);
+        if(demo.menu_index!=moves[i][2]||healthy)return (int)i+1;
+    }
+    p.select_count++;p.sequence++;now+=20000;deliver(&p,now);update_joystick(now);
+    if(demo.view!=GAME_VIEW||demo.state!=SENSOR_ERROR)return 10;
+    // A duplicate count must not perform a second selection.
+    p.sequence++;now+=20000;deliver(&p,now);update_joystick(now);
+    if(remote_press)return 11;
+    command("MENU");unsigned selection=demo.menu_index;
+    mock_time=now+1000001;remote_tick();update_joystick(mock_time);
+    if(remote_connected||demo.menu_index!=selection)return 12;
+    // Old axis data must not navigate after disconnect.
+    remote_packet.joy_x=4095;
+    update_joystick(mock_time+20000);
+    if(demo.menu_index!=selection)return 13;
     return 0;
 }

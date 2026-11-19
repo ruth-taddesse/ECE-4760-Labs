@@ -6,4 +6,5 @@ void radio_poll(void);
 bool radio_take(WirePacket *packet);
 void radio_send(const WirePacket *packet);
 uint32_t radio_session(void);
+void radio_debug_print(void);
 #endif

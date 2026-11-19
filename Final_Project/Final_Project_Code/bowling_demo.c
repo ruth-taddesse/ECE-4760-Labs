@@ -197,7 +197,11 @@ static void draw_menu(const Demo *d){
         label(26,386,BLACK,"Joystick: left/right across tiles; up/down changes row.");
         label(26,400,BLACK,"Press joystick SW to select the highlighted option.");
         label(26,416,BLACK,"USB keyboard: W/S + Enter, or 1-5, also works.");
-        label(26,434,d->sensor_ok?BLUE:RED,d->sensor_ok?
+        label(26,434,d->sensor_ok?BLUE:RED,
+#ifdef SPORTS_WIRELESS_GROUND
+              !d->wireless_connected?"Controller offline / IMU status unknown":
+#endif
+              d->sensor_ok?
               d->is_calibrated?"Controller calibrated / ready":"Select Bowling, then CAL to calibrate":"IMU unavailable / check wiring and reboot");
     }else if(d->view==SETTINGS_VIEW){
         title(24,100,BLUE,"SETTINGS");
@@ -358,6 +362,7 @@ static void help(void){
 #ifdef SPORTS_WIRELESS_GROUND
     puts("# SPORTS_GROUND / Pico W / Wi-Fi AP PicoSports. Handheld joins automatically.");
     puts("# Short SW: select, calibrate, or bowl. Hold SW 1s: menu/cancel. Watch VGA cues.");
+    puts("# DIAG: Wi-Fi/UDP counters and last received joystick values.");
 #endif
     puts("# PICO SPORTS: USB terminal controls the VGA menus. W/S then Enter, or 1-5.");
     puts("# 1 BOWLING | 2 BASKETBALL (coming soon) | 3 CUP PONG (coming soon) | 4 SETTINGS | 5 QUIT");
@@ -383,6 +388,16 @@ static void command(const char *input){
     for(size_t i=0;i<length&&normalized[i]!=' ';i++)
         if(normalized[i]>='a'&&normalized[i]<='z')normalized[i]-='a'-'A';
     const char *line=normalized;
+#ifdef SPORTS_WIRELESS_GROUND
+    if(!strcmp(line,"DIAG")){
+        radio_debug_print();
+        printf("# REMOTE connected=%u x=%lu y=%lu clicks=%lu holds=%lu imu=%u calibrated=%u\n",
+               remote_connected,(unsigned long)remote_packet.joy_x,(unsigned long)remote_packet.joy_y,
+               (unsigned long)remote_packet.select_count,(unsigned long)remote_packet.menu_count,
+               healthy,calibrated);
+        return;
+    }
+#endif
     bool busy=demo.state==RECORDING||demo.state==COUNTDOWN;
     // Navigation may cancel a pending capture; never leave acquisition running behind a menu.
     bool home=!strcmp(line,"MENU")||!strcmp(line,"HOME");
@@ -478,14 +493,19 @@ int main(void) {
     gpio_init(JOY_SW);gpio_set_dir(JOY_SW,GPIO_IN);gpio_pull_up(JOY_SW);
 #endif
     joystick_last=time_us_64();
+    // Start VGA before probing external hardware. A missing or stalled IMU must
+    // never prevent the menu (and, more importantly, VGA sync) from appearing.
+    demo.sensor_ok=false;demo.view=HOME_VIEW;demo.state=SENSOR_ERROR;demo.tuning=bowl_defaults();
+    multicore_launch_core1(draw_core);
 #ifdef SPORTS_WIRELESS_GROUND
     if(!radio_init(true))panic("Ground Wi-Fi init failed");
     healthy=false;
 #else
     healthy=imu_init();
 #endif
-    demo.sensor_ok=healthy;demo.view=HOME_VIEW;demo.state=healthy?NEED_CAL:SENSOR_ERROR;demo.tuning=bowl_defaults();
-    multicore_launch_core1(draw_core);
+    mutex_enter_blocking(&lock);
+    demo.sensor_ok=healthy;demo.state=healthy?NEED_CAL:SENSOR_ERROR;
+    mutex_exit(&lock);
     char input[128];unsigned used=0;bool overflow=false,last_cr=false,connected_before=false,pending=false;
     while(true) {
         bool connected=stdio_usb_connected();if(connected&&!connected_before)pending=true;connected_before=connected;
