@@ -51,6 +51,18 @@ def simulate(shot,tuning=None,seed=42):
     return result
 
 class BowlingTests(unittest.TestCase):
+    def test_joystick_position_and_capture_lock(self):
+        lib.test_joystick.argtypes=[C.c_uint,C.c_int,C.c_float,C.c_uint]
+        lib.test_joystick.restype=C.c_float
+        move=lib.test_joystick
+        self.assertAlmostEqual(move(2200,1,.5,100),.5)
+        self.assertGreater(move(4095,1,0,50),0)
+        self.assertLess(move(0,1,0,50),0)
+        self.assertAlmostEqual(move(4095,1,0,1000),1.3,places=5)
+        self.assertAlmostEqual(move(0,1,0,1000),-1.3,places=5)
+        for state in [0,2,3,4,5,7]:
+            self.assertAlmostEqual(move(4095,state,.4,100),.4,places=5)
+
     def test_straight_and_first_pin(self):
         p=simulate(Shot(power=.5,hook=0))
         self.assertEqual(p.pin,0)

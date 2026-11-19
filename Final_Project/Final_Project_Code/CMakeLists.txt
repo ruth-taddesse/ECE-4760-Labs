@@ -69,7 +69,7 @@ foreach(pio_file hsync vsync rgb)
 endforeach()
 target_link_libraries(BOWLING_DEMO pico_stdlib pico_bootsel_via_double_reset
     pico_multicore hardware_dma hardware_irq hardware_pio hardware_sync
-    hardware_i2c hardware_clocks)
+    hardware_i2c hardware_clocks hardware_adc)
 pico_enable_stdio_usb(BOWLING_DEMO 1)
 pico_enable_stdio_uart(BOWLING_DEMO 0)
 pico_add_extra_outputs(BOWLING_DEMO)

@@ -9,6 +9,7 @@
 #include "pico/multicore.h"
 #include "pico/mutex.h"
 #include "hardware/clocks.h"
+#include "hardware/adc.h"
 #include "imu.h"
 #include "bowling_model.h"
 #include "VGA/vga16_graphics_v3.h"
@@ -25,6 +26,33 @@ static BowlFeatures features;
 static bool healthy,calibrated;
 static uint64_t countdown_end,capture_start,next_sample;
 static unsigned shot_seed=1;
+// VRx: GPIO27 / ADC1 / physical pin 32. Power joystick from 3.3 V.
+#define JOY_GPIO 27
+#define JOY_ADC 1
+#define JOY_CENTER 2048.0f
+#define JOY_DEADZONE 256.0f
+#define JOY_SPEED 1.5f // lane units per second at full deflection
+#define JOY_DIRECTION 1.0f // change to -1 if the mounted joystick is reversed
+static uint64_t joystick_last;
+static void update_joystick(uint64_t now) {
+    if(now-joystick_last<10000)return;
+    float dt=fminf((now-joystick_last)*1e-6f,0.02f);
+    joystick_last=now;
+    // No ADC work during capture; position is frozen from countdown through replay.
+    bool finished=demo.state==PLAYING && demo.path.count &&
+        (now-demo.animation_start)*1e-6f>=demo.path.points[demo.path.count-1].t;
+    if(demo.state!=READY && demo.state!=BAD_CAPTURE && !finished)return;
+    adc_select_input(JOY_ADC);
+    unsigned sum=0;for(int i=0;i<8;i++)sum+=adc_read();
+    float delta=sum/8.0f-JOY_CENTER;
+    if(fabsf(delta)<=JOY_DEADZONE)return;
+    float velocity=JOY_DIRECTION*copysignf((fabsf(delta)-JOY_DEADZONE)/(2048.0f-JOY_DEADZONE),delta);
+    mutex_enter_blocking(&lock);
+    demo.tuning.start_x=fmaxf(-1.3f,fminf(1.3f,demo.tuning.start_x+velocity*JOY_SPEED*dt));
+    // Moving after a completed shot returns the ball to the foul line for the next throw.
+    demo.has_shot=false;demo.state=READY;
+    mutex_exit(&lock);
+}
 static const int lane_x=150,lane_bottom=440;
 #define SCALE 50.0f
 static int sx(float x){return lane_x+(int)lroundf(x*SCALE);}
@@ -40,7 +68,7 @@ static void draw_core(void) {
         const char *status="";
         switch(screen.state) {
             case NEED_CAL:status="Place +Z up; type CAL + Enter";break;
-            case READY:status="Press Enter to record a throw";break;
+            case READY:status="Joystick: move start / Enter: throw";break;
             case CALIBRATING:status="CALIBRATING - keep still";break;
             case COUNTDOWN:snprintf(text,sizeof(text),"GET READY: %u",screen.countdown);status=text;break;
             case RECORDING:status=screen.phase==0?"HOLD STILL":screen.phase==1?"THROW NOW":"HOLD STILL - finishing";break;
@@ -88,6 +116,7 @@ static void draw_core(void) {
         snprintf(text,sizeof(text),"speed_gain %.2f  hook_gain %.2f",screen.tuning.speed_gain,screen.tuning.hook_gain);label(280,253,WHITE,text);
         snprintf(text,sizeof(text),"friction %.2f    hook_start %.2f",screen.tuning.friction,screen.tuning.hook_start);label(280,271,WHITE,text);
         snprintf(text,sizeof(text),"randomness %.2f (0 = repeatable)",screen.tuning.randomness);label(280,289,WHITE,text);
+        label(280,307,CYAN,"Joystick X: move starting position");
         label(280,319,WHITE,"CAL: +Z-up calibration");
         label(280,337,WHITE,"Enter/THROW: countdown + capture");
         label(280,355,WHITE,"REPLAY: repeat last path");
@@ -101,6 +130,7 @@ static void help(void) {
     puts("# BOWLING DEMO ready. CAL + Enter: place sensor +Z up and leave still 3 seconds.");
     puts("# Then press Enter or send THROW: 3s countdown, 0.5s still, 2s THROW NOW, 0.5s still.");
     puts("# Watch VGA cues. Path is displayed after recording; no measured release event.");
+    puts("# Joystick VRx on GPIO27/ADC1: move start left/right; release to hold. Enter locks position.");
     puts("# SET start_x -0.5 | SET aim_deg 1 | SET hook_gain 1.5 | SET speed_gain 1.1");
     puts("# SET friction 0.12 | SET hook_start 0.1 | SET randomness 0");
     puts("# SET replays the last throw with new settings. REPLAY, RESET, INFO, HELP, STOP.");
@@ -153,6 +183,8 @@ static void command(const char *line) {
 }
 int main(void) {
     set_sys_clock_khz(150000,true);stdio_init_all();mutex_init(&lock);initVGA();
+    adc_init();adc_gpio_init(JOY_GPIO);adc_select_input(JOY_ADC);
+    joystick_last=time_us_64();
     healthy=imu_init();demo.state=healthy?NEED_CAL:SENSOR_ERROR;demo.tuning=bowl_defaults();
     multicore_launch_core1(draw_core);
     char input[128];unsigned used=0;bool overflow=false,last_cr=false,connected_before=false,pending=false;
@@ -170,6 +202,7 @@ int main(void) {
             else overflow=true;
         }
         uint64_t now=time_us_64();
+        update_joystick(now);
         mutex_enter_blocking(&lock);
         if(demo.state==COUNTDOWN) {
             if(now>=countdown_end){demo.state=RECORDING;demo.phase=0;demo.countdown=0;capture_start=next_sample=now;}

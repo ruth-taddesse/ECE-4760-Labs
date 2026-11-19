@@ -4,6 +4,8 @@ This separate firmware draws a top-down lane, ten pins, an animated ball and a p
 
 ## Run
 
+**VS Code USB shortcut:** Close Serial Monitor, then choose **Terminal > Run Task > Run Bowling Demo (USB)**. This task builds and explicitly loads `BOWLING_DEMO.uf2`. The generic **Run Project** task uses the extension's selected target and may still load the collection firmware. If USB loading fails, use BOOTSEL and copy the UF2 as described below. The bowling screen says **PICO SPORTS / BOWLING PATH DEMO**, with a lane and ten white pins.
+
 1. Use **Compile Project** in VS Code. Both collection and bowling targets build.
 2. Hold BOOTSEL while connecting the Pico 2, then copy **build/BOWLING_DEMO.uf2** to its USB drive. The collection firmware is **MPU6050_IMU.uf2**, a different target.
 3. Keep the existing MPU6050 and VGA wiring. Close VS Code's Serial Monitor so the Python terminal can open the port.
@@ -22,6 +24,12 @@ If the COM number changes, run without `--port` to list ports. You can instead u
 The game runs on the Pico. Python only supplies keyboard commands and terminal feedback. This demo does **not** append to or modify any training CSV. Settings and the last throw live in RAM and reset at reboot.
 
 ## Tune the path
+
+### Joystick starting position
+
+Wire joystick VRx to **GPIO27 / ADC1 / physical pin 32**, VCC to **3.3 V**, and GND to Pico ground. After IMU calibration, pushing left/right moves the cyan ball along the foul line; releasing the stick holds that position. Greater deflection moves faster. Pressing Enter freezes the position through countdown, capture and animation. After animation finishes, moving the joystick clears the old path and positions the next throw. No joystick button is required.
+
+The input is averaged at 100 Hz with a 256-count center dead zone. Starting position stays within ±1.3 lane units. Adjust `JOY_CENTER`, `JOY_DEADZONE`, `JOY_SPEED`, or `JOY_DIRECTION` near the top of `bowling_demo.c` if needed; set direction to `-1.0f` if left/right are reversed. Rebuild and flash after changing these constants. Keep the joystick connected when using this firmware, since a disconnected ADC input can float.
 
 Enter commands such as `SET hook_gain 1.5`. Each successful change automatically replays the last throw, allowing comparisons without another gesture. `REPLAY` repeats it; `RESET` restores defaults. `STOP` cancels a capture when sent directly over serial.
 

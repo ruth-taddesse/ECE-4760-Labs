@@ -11,6 +11,16 @@ static unsigned char pixels[640*480];
 static jmp_buf draw_done;
 static int frames;
 static uint64_t mock_time;
+static uint16_t mock_adc=2048;
+void adc_init(void){} void adc_gpio_init(unsigned gpio){(void)gpio;}
+void adc_select_input(unsigned input){(void)input;}
+uint16_t adc_read(void){return mock_adc;}
+float test_joystick(unsigned raw,int state,float start,unsigned ticks){
+    memset(&demo,0,sizeof(demo));demo.state=state;demo.tuning=bowl_defaults();
+    demo.tuning.start_x=start;mock_adc=(uint16_t)raw;joystick_last=0;
+    for(unsigned i=1;i<=ticks;i++)update_joystick(i*10000ull);
+    return demo.tuning.start_x;
+}
 uint64_t time_us_64(void){return mock_time;}
 void stdio_init_all(void){} void stdio_flush(void){fflush(stdout);}
 void sleep_us(uint64_t us){mock_time+=us;} void tight_loop_contents(void){}
