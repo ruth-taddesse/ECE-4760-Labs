@@ -41,7 +41,7 @@ monitor previews are written under `build/bowling_ui/monitor_16x9/`.
    game selection, `SETTINGS` opens tuning, and `QUIT` (or `q`) stops the session
    and closes the host terminal.
 
-If the COM number changes, run without `--port` to list ports. You can instead use a serial monitor at 115200 baud: send `CAL`, then blank Enter or `THROW`. Commands need a newline. `HELP` prints instructions; `INFO` returns `BOWL,1,<sensor healthy>,<calibrated>`.
+If the COM number changes, run without `--port` to list ports. You can instead use a serial monitor at 115200 baud: send `CAL`, then blank Enter or `THROW`. Commands need a newline and are case-insensitive, so `cal`, `Throw`, and `MENU` are equivalent. `SET` parameter names are also case-insensitive. `HELP` prints instructions; `INFO` returns `BOWL,1,<sensor healthy>,<calibrated>`.
 
 ## Menu controls
 
@@ -108,6 +108,7 @@ These are **game units**, not measured ball speed, spin or a fitted physical bow
 
 - `bowling_demo.c`: capture timing, USB commands and VGA rendering.
 - `bowling_model.c/.h`: feature extraction, classification and trajectory math.
+- `sports_views.c/.h`: preliminary basketball and cup-pong VGA views.
 - `bowling_trained.h`: generated training constants.
 - `bowling_model_report.json`: dataset fingerprint, class counts and leave-one-out results.
 - `host/play_bowling.py`: keyboard terminal.
@@ -122,7 +123,7 @@ Then rebuild firmware. Offline tests exercise the actual C classifier and trajec
 
 ```powershell
 $env:ZIG_GLOBAL_CACHE_DIR = Join-Path (Get-Location) 'build/zig-cache'
-& ./.venv/Scripts/python.exe -m ziglang cc -shared -O2 -Itests/stubs -I. bowling_model.c tests/bowling_native.c -o build/bowling_native.dll '-Wl,--export-all-symbols'
+& ./.venv/Scripts/python.exe -m ziglang cc -shared -O2 -Itests/stubs -I. bowling_model.c sports_views.c tests/bowling_native.c -o build/bowling_native.dll '-Wl,--export-all-symbols'
 & ./.venv/Scripts/python.exe tests/test_bowling_native.py
 ```
 

@@ -12,6 +12,7 @@
 #include "hardware/adc.h"
 #include "imu.h"
 #include "bowling_model.h"
+#include "sports_views.h"
 #include "VGA/vga16_graphics_v3.h"
 enum { NEED_CAL, READY, CALIBRATING, COUNTDOWN, RECORDING, PLAYING, BAD_CAPTURE, SENSOR_ERROR };
 enum { HOME_VIEW, GAME_VIEW, SETTINGS_VIEW, UNAVAILABLE_VIEW, QUIT_VIEW };
@@ -99,7 +100,8 @@ static void update_joystick(uint64_t now) {
 #define CAMERA_X_SCALE 190.0f
 #define CAMERA_Y_SCALE 145.0f
 #define CAMERA_DEPTH 0.38f
-#define FOUL_LINE_Y 438
+#define BOTTOM_SAFE_MARGIN 8
+#define FOUL_LINE_Y (438-BOTTOM_SAFE_MARGIN)
 #define DISPLAY_X_CORRECTION 0.75f // 640x480 stretched by monitor to 16:9
 #define PIN_RACK_X_SCALE 50.0f
 #define PIN_RACK_FRONT_Y 201
@@ -143,6 +145,8 @@ static void button(int x,int y,int w,int h,const char *name,const char *detail,b
 }
 static void draw_menu(const Demo *d){
     clearLowFrame(0,WHITE);
+    if(d->view==UNAVAILABLE_VIEW&&d->unavailable_game==1){draw_basketball_view();return;}
+    if(d->view==UNAVAILABLE_VIEW&&d->unavailable_game==2){draw_cup_pong_view();return;}
     title(24,22,BLUE,"PICO SPORTS");
     label(26,56,BLACK,"because ECEs can have fun too!");
     drawHLine(24,78,592,LIGHT_BLUE);
@@ -201,8 +205,8 @@ static void draw_menu(const Demo *d){
         label(26,196,BLACK,"Settings remain in RAM until reboot.");
         button(24,290,592,64,"PLAY AGAIN","Press SW, Enter or type MENU",true);
     }
-    drawHLine(24,454,592,LIGHT_BLUE);
-    label(26,468,BLUE,"Pico 2 + MPU6050 / Joystick + USB keyboard / VGA");
+    drawHLine(24,454-BOTTOM_SAFE_MARGIN,592,LIGHT_BLUE);
+    label(26,468-BOTTOM_SAFE_MARGIN,BLUE,"Pico 2 + MPU6050 / Joystick + USB keyboard / VGA");
 }
 static void draw_game(const Demo *d){
     char text[100];
@@ -290,11 +294,11 @@ static void draw_game(const Demo *d){
     }
     if(d->has_shot){
         snprintf(text,sizeof(text),"%s / Power %.2f / Hook %+.2f",bowl_labels[d->shot.label],d->shot.power,d->shot.hook);
-        label(14,446,BLUE,text);
-    }else label(14,446,BLUE,"Start with the same grip used for your training throws.");
+        label(14,446-BOTTOM_SAFE_MARGIN,BLUE,text);
+    }else label(14,446-BOTTOM_SAFE_MARGIN,BLUE,"Start with the same grip used for your training throws.");
     snprintf(text,sizeof(text),"Samples %u / I2C %u / gaps %u / rail %u",d->samples,d->errors,d->missed,d->rail);
-    label(350,446,BLACK,text);
-    label(14,460,BLUE,"First contact only / pin scattering and scoring pending");
+    label(350,446-BOTTOM_SAFE_MARGIN,BLACK,text);
+    label(14,460-BOTTOM_SAFE_MARGIN,BLUE,"First contact only / pin scattering and scoring pending");
 }
 static void draw_core(void){
     while(true){
@@ -318,7 +322,16 @@ static void replay(void) {
     bowl_simulate(&demo.shot,&demo.tuning,shot_seed,&demo.path);
     demo.animation_start=time_us_64();demo.state=PLAYING;
 }
-static void command(const char *line){
+static void command(const char *input){
+    // Accept command words from Serial Monitor in uppercase, lowercase, or a
+    // mixture of both. SET parameter names are normalized separately below.
+    char normalized[128];
+    size_t length=strlen(input);
+    if(length>=sizeof(normalized))length=sizeof(normalized)-1;
+    memcpy(normalized,input,length);normalized[length]=0;
+    for(size_t i=0;i<length&&normalized[i]!=' ';i++)
+        if(normalized[i]>='a'&&normalized[i]<='z')normalized[i]-='a'-'A';
+    const char *line=normalized;
     bool busy=demo.state==RECORDING||demo.state==COUNTDOWN;
     // Navigation may cancel a pending capture; never leave acquisition running behind a menu.
     bool home=!strcmp(line,"MENU")||!strcmp(line,"HOME");
@@ -382,6 +395,7 @@ static void command(const char *line){
     }
     char key[32],extra;float value;
     bool set=sscanf(line,"SET %31s %f %c",key,&value,&extra)==2;
+    if(set)for(char *p=key;*p;p++)if(*p>='A'&&*p<='Z')*p+='a'-'A';
     mutex_enter_blocking(&lock);
     bool ok=false;
     if(set)ok=bowl_set(&demo.tuning,key,value);

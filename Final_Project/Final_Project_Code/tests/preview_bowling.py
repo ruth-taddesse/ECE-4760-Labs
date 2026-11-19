@@ -41,7 +41,8 @@ def main():
     library = ROOT / 'build/bowling_native.dll'
     subprocess.run([os.environ.get('CC', 'cc'), '-shared', '-fPIC', '-O2',
                     '-I' + str(ROOT / 'tests/stubs'), '-I' + str(ROOT),
-                    str(ROOT / 'bowling_model.c'), str(ROOT / 'tests/bowling_native.c'),
+                    str(ROOT / 'bowling_model.c'), str(ROOT / 'sports_views.c'),
+                    str(ROOT / 'tests/bowling_native.c'),
                     '-lm', '-o', str(library)], check=True)
     lib = C.CDLL(str(library))
     result = lib.test_navigation()

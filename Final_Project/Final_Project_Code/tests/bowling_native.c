@@ -101,13 +101,13 @@ unsigned test_bounds_errors(void){return bounds_errors;}
 int test_navigation(void){
     memset(&demo,0,sizeof(demo));demo.tuning=bowl_defaults();healthy=true;calibrated=false;
     command("2");if(demo.view!=UNAVAILABLE_VIEW)return 1;
-    command("");command("W");if(demo.menu_index!=0)return 2;
+    command("");command("w");if(demo.menu_index!=0)return 2;
     command("");if(demo.view!=GAME_VIEW||demo.state!=NEED_CAL)return 3;
     calibration_ok=false;command("CAL");if(demo.state!=NEED_CAL||demo.is_calibrated)return 4;
-    calibration_ok=true;command("CAL");if(demo.state!=READY||!demo.is_calibrated)return 5;
-    command("THROW");if(demo.state!=COUNTDOWN)return 6;
-    command("MENU");if(demo.view!=HOME_VIEW||demo.state!=READY)return 7;
-    command("1");command("SETTINGS");command("SET aim_deg 2");
+    calibration_ok=true;command("cal");if(demo.state!=READY||!demo.is_calibrated)return 5;
+    command("throw");if(demo.state!=COUNTDOWN)return 6;
+    command("menu");if(demo.view!=HOME_VIEW||demo.state!=READY)return 7;
+    command("1");command("settings");command("set AIM_DEG 2");
     if(demo.view!=SETTINGS_VIEW||demo.tuning.aim_deg!=2)return 8;
     command("BACK");if(demo.view!=GAME_VIEW)return 9;
     command("THROW");command("QUIT");if(demo.view!=QUIT_VIEW||demo.state!=READY)return 10;

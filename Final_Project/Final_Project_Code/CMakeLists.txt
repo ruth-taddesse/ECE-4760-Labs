@@ -60,7 +60,7 @@ pico_enable_stdio_uart(MPU6050_IMU 0)
 pico_add_extra_outputs(MPU6050_IMU)
 
 # Separate first-game prototype. The data-collection target remains available.
-add_executable(BOWLING_DEMO bowling_demo.c bowling_model.c imu.c mpu6050.c
+add_executable(BOWLING_DEMO bowling_demo.c sports_views.c bowling_model.c imu.c mpu6050.c
                VGA/vga16_graphics_v3.c)
 foreach(pio_file hsync vsync rgb)
     pico_generate_pio_header(BOWLING_DEMO ${CMAKE_CURRENT_LIST_DIR}/VGA/${pio_file}.pio)

@@ -6,3 +6,4 @@ data/
 analysis/
 .venv/
 !.vscode/*
+VGA_Previews
