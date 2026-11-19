@@ -23,8 +23,6 @@ include(pico_sdk_import.cmake)
 # give the project a name (anything you want)
 project(MPU6050_IMU C CXX ASM)
 
-set(pioasm_DIR "C:/Users/Kaelem/.pico-sdk/tools/2.3.1/pioasm")
-
 # initialize the sdk
 pico_sdk_init()
 

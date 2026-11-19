@@ -1,5 +1,6 @@
 """USB terminal for BOWLING_DEMO.uf2; the Pico runs capture, classification and physics."""
 import argparse
+import time
 import serial
 from serial.tools import list_ports
 from collect import Link
@@ -17,34 +18,47 @@ def main():
         device.dtr=True
         device.write(b'STOP\n')
         link=Link(device);link.send('INFO')
-        info=link.response('BOWL,',5)
-        if len(info)!=4 or info[1]!='1' or info[2]!='1':raise ValueError(f'Wrong firmware or sensor failure: {info}')
+        deadline=time.monotonic()+5
         while True:
-            if input('Place sensor +Z up on table. Enter to calibrate; q to quit: ').strip().lower()=='q':return
-            link.send('CAL')
-            try:print(','.join(link.response('CAL,',6)));break
-            except ValueError as e:print(e)
-        print('Enter starts a throw. Watch VGA: 3s countdown, HOLD STILL, THROW NOW, HOLD STILL.')
-        print('Use SET start_x -0.5, SET hook_gain 1.5, SET speed_gain 1.1, REPLAY or RESET.')
-        print('Tuning replays the last throw. q quits. This demo does not save collection CSVs.')
+            reply=link.line(deadline)
+            if reply.startswith('INFO,'):
+                raise ValueError('Collection firmware is loaded. Flash build/BOWLING_DEMO.uf2 for the game menu.')
+            if reply.startswith('ERR,'):
+                raise ValueError(reply)
+            if reply.startswith('BOWL,'):
+                info=reply.split(',')
+                break
+        if len(info)!=4 or info[1]!='1':raise ValueError(f'Wrong firmware: {info}')
+        link.send('MENU')
+        print(','.join(link.response('OK,',3)))
+        print('VGA menu: 1 Bowling / 2 Basketball / 3 Cup pong / 4 Settings / 5 Quit.')
+        print('Type W then Enter to move up, or S then Enter to move down.')
+        print('Press Enter to select the highlighted option. MENU returns to game selection.')
+        print('In Bowling: CAL calibrates (+Z up, still), then Enter starts a throw.')
+        print('SETTINGS opens tuning; BACK returns. QUIT (or q) ends the session.')
+        print('This prototype does not save collection CSVs.')
         while True:
-            command=input('Enter to throw, or command: ').strip()
-            if command.lower()=='q':return
-            # Accept case-insensitive command words, preserve lowercase parameter names.
-            parts=command.split(maxsplit=1)
-            command=(parts[0].upper()+(' '+parts[1] if len(parts)>1 else '')) if parts else 'THROW'
+            text=input('Pico Sports > ').strip()
+            parts=text.split(maxsplit=1)
+            command=(parts[0].upper()+(' '+parts[1] if len(parts)>1 else '')) if parts else ''
+            if command=='Q':command='QUIT'
             link.send(command)
             try:
-                if command=='THROW':
-                    print(','.join(link.response('ACK,',3)))
+                # Menu Enter returns OK; game Enter starts a throw and returns ACK.
+                deadline=time.monotonic()+6
+                while True:
+                    reply=link.line(deadline)
+                    if reply.startswith('ERR,'):raise ValueError(reply)
+                    if reply.startswith(('OK,','ACK,','CAL,','BOWL,')):break
+                print(reply)
+                if reply.startswith('ACK,'):
                     print(','.join(link.response('RESULT,',12)))
-                    print('Watch the VGA ball trail; then press Enter for another throw.')
-                else:
-                    print(','.join(link.response('CAL,' if command=='CAL' else 'BOWL,' if command=='INFO' else 'OK,',6)))
+                    print('Watch the VGA ball trail; Enter bowls again, MENU returns.')
+                if command in ('QUIT','5'):return
             except (ValueError,TimeoutError) as error:print(error)
 
 
 if __name__=='__main__':
     try:main()
-    except (KeyboardInterrupt,EOFError):print('\nBowling demo closed.')
+    except (KeyboardInterrupt,EOFError):print('\nTerminal closed. Use QUIT before closing to stop the session on the Pico.')
     except (serial.SerialException,ValueError,TimeoutError) as e:print(f'Connection/demo error: {e}')

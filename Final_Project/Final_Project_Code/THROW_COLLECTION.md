@@ -104,6 +104,37 @@ trial ID, sample count, peaks, near-rail samples, read errors and missed slots.
 The completed plot freezes. Countdown and phase boundaries are experiment cues,
 **not measured release events**. No release velocity or launch angle is inferred.
 
+### VGA capture interface
+
+The `MPU6050_IMU` target now shows a 640x480 capture dashboard:
+
+- USB serial connection, sport, requested category, and trial ID at the top.
+- A large calibration / countdown / HOLD STILL / THROW NOW / completion cue.
+- Three phase indicators and a progress bar for the configured trial duration.
+- Raw acceleration, gyro, and magnitude plots with phase boundaries. Trace lines
+  break at missing sequence numbers instead of drawing across missing samples.
+- Sample count, peaks, calibration status, I2C errors, missed slots, and near-rail
+  samples. Stopped and suspect captures have distinct review messages.
+
+Controls remain in `host/collect.py`: the VGA is a display, with no buttons or
+on-screen menus. Until the host starts a trial, sport/category show as awaiting
+selection. `CAPTURE COMPLETE` means the Pico finished recording; acceptance and
+disk storage happen in the host terminal. The frozen screen does not acknowledge
+a successful save because protocol v2 has no host-to-Pico save acknowledgement.
+The separate `BOWLING_DEMO` target retains its bowling lane interface.
+
+To preview the actual collection drawing code without a Pico, install Pillow
+and use a native C compiler (`cc` by default, or set `CC`), then run:
+
+```sh
+python3 tests/preview_collection.py
+```
+
+This checks CAL/START/STOP state transitions and drawing bounds, and writes
+13 state previews plus `build/vga_preview/all_states.png`. Sensor traces in
+these previews are synthetic. Desktop previews do not verify physical VGA
+timing, capture timing, or I2C behavior.
+
 **Hardware check:** perform a stationary trial first. Default capture should
 have about 300 samples and measured rate near 100 Hz, with zero I2C errors,
 sequence gaps and near-rail samples. Unexpected gaps/range warnings are displayed

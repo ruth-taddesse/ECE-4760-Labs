@@ -7,16 +7,19 @@
 #include "../bowling_demo.c"
 #undef main
 #include "../VGA/font_glcd.c"
+#include "../VGA/font_Arial_round_16x24.h"
 static unsigned char pixels[640*480];
 static jmp_buf draw_done;
 static int frames;
 static uint64_t mock_time;
+static unsigned bounds_errors;
+static bool calibration_ok;
 static uint16_t mock_adc=2048;
 void adc_init(void){} void adc_gpio_init(unsigned gpio){(void)gpio;}
 void adc_select_input(unsigned input){(void)input;}
 uint16_t adc_read(void){return mock_adc;}
 float test_joystick(unsigned raw,int state,float start,unsigned ticks){
-    memset(&demo,0,sizeof(demo));demo.state=state;demo.tuning=bowl_defaults();
+    memset(&demo,0,sizeof(demo));demo.view=GAME_VIEW;demo.state=state;demo.tuning=bowl_defaults();
     demo.tuning.start_x=start;mock_adc=(uint16_t)raw;joystick_last=0;
     for(unsigned i=1;i<=ticks;i++)update_joystick(i*10000ull);
     return demo.tuning.start_x;
@@ -30,11 +33,11 @@ void multicore_launch_core1(void(*entry)(void)){(void)entry;}
 void mutex_init(mutex_t*m){(void)m;} void mutex_enter_blocking(mutex_t*m){(void)m;} void mutex_exit(mutex_t*m){(void)m;}
 bool set_sys_clock_khz(unsigned khz,bool required){(void)khz;(void)required;return true;}
 bool imu_init(void){return false;} bool imu_read(ImuReading*r){(void)r;return false;}
-bool imu_calibrate(ImuBias*b){(void)b;return false;}
+bool imu_calibrate(ImuBias*b){memset(b,0,sizeof(*b));return calibration_ok;}
 const char *imu_calibration_report(void){return "test";}
 void initVGA(void){}
 int draw_start_signal(void){if(frames++)longjmp(draw_done,1);return 1;}
-void drawPixel(short x,short y,char color){if(x>=0&&x<640&&y>=0&&y<480)pixels[y*640+x]=(unsigned char)color;}
+void drawPixel(short x,short y,char color){if(x>=0&&x<640&&y>=0&&y<480)pixels[y*640+x]=(unsigned char)color;else bounds_errors++;}
 void drawHLine(int x,int y,int w,char c){for(int i=0;i<w;i++)drawPixel(x+i,y,c);}
 void drawVLine(short x,short y,short h,char c){for(int i=0;i<h;i++)drawPixel(x,y+i,c);}
 void drawRect(short x,short y,short w,short h,char c){drawHLine(x,y,w,c);drawHLine(x,y+h-1,w,c);drawVLine(x,y,h,c);drawVLine(x+w-1,y,h,c);}
@@ -53,8 +56,56 @@ int drawTextGLCD(short x,short y,char *s,char c,char bg){
     return x-start;
 }
 unsigned char *test_render(const BowlThrow *shot,const BowlTuning *tuning,unsigned seed,float seconds){
-    memset(&demo,0,sizeof(demo));demo.state=PLAYING;demo.tuning=*tuning;demo.shot=*shot;demo.has_shot=true;demo.samples=300;
+    memset(&demo,0,sizeof(demo));demo.view=GAME_VIEW;demo.state=PLAYING;demo.tuning=*tuning;demo.shot=*shot;demo.has_shot=true;demo.samples=300;
     bowl_simulate(shot,tuning,seed,&demo.path);mock_time=(uint64_t)(seconds*1000000);frames=0;
     if(!setjmp(draw_done))draw_core();
     return pixels;
+}
+
+void fillRect(short x,short y,short w,short h,char c){for(int i=0;i<h;i++)drawHLine(x,y+i,w,c);}
+void drawCircle(short x,short y,short r,char c){
+    // Same midpoint algorithm used by the VGA library.
+    int f=1-r,dx=1,dy=-2*r,a=0,b=r;
+    drawPixel(x,y+r,c);drawPixel(x,y-r,c);drawPixel(x+r,y,c);drawPixel(x-r,y,c);
+    while(a<b){
+        if(f>=0){b--;dy+=2;f+=dy;}a++;dx+=2;f+=dx;
+        drawPixel(x+a,y+b,c);drawPixel(x-a,y+b,c);drawPixel(x+a,y-b,c);drawPixel(x-a,y-b,c);
+        drawPixel(x+b,y+a,c);drawPixel(x-b,y+a,c);drawPixel(x+b,y-a,c);drawPixel(x-b,y-a,c);
+    }
+}
+int drawTextArial24(short x,short y,char *s,char c,char bg){
+    int start=x;
+    for(;*s;s++,x+=16)for(int row=0;row<24;row++)for(int col=0;col<16;col++){
+        unsigned char bits=Arial_round_16x24[((unsigned char)*s-32)*48+row*2+col/8];
+        drawPixel(x+col,y+row,(bits&(1u<<(7-col%8)))?c:bg);
+    }
+    return x-start;
+}
+unsigned char *test_ui(int view,int state,unsigned selection,float seconds){
+    memset(&demo,0,sizeof(demo));demo.view=view;demo.state=state;demo.menu_index=selection;
+    demo.unavailable_game=selection;demo.sensor_ok=true;demo.tuning=bowl_defaults();demo.countdown=3;demo.phase=selection;
+    if(state==PLAYING){
+        demo.has_shot=true;demo.shot.power=.5f;demo.shot.hook=.35f;
+        bowl_simulate(&demo.shot,&demo.tuning,42,&demo.path);demo.samples=300;
+    }
+    mock_time=(uint64_t)(seconds*1000000);bounds_errors=0;frames=0;
+    if(!setjmp(draw_done))draw_core();return pixels;
+}
+unsigned test_bounds_errors(void){return bounds_errors;}
+int test_navigation(void){
+    memset(&demo,0,sizeof(demo));demo.tuning=bowl_defaults();healthy=true;calibrated=false;
+    command("2");if(demo.view!=UNAVAILABLE_VIEW)return 1;
+    command("");command("W");if(demo.menu_index!=0)return 2;
+    command("");if(demo.view!=GAME_VIEW||demo.state!=NEED_CAL)return 3;
+    calibration_ok=false;command("CAL");if(demo.state!=NEED_CAL||demo.is_calibrated)return 4;
+    calibration_ok=true;command("CAL");if(demo.state!=READY||!demo.is_calibrated)return 5;
+    command("THROW");if(demo.state!=COUNTDOWN)return 6;
+    command("MENU");if(demo.view!=HOME_VIEW||demo.state!=READY)return 7;
+    command("1");command("SETTINGS");command("SET aim_deg 2");
+    if(demo.view!=SETTINGS_VIEW||demo.tuning.aim_deg!=2)return 8;
+    command("BACK");if(demo.view!=GAME_VIEW)return 9;
+    command("THROW");command("QUIT");if(demo.view!=QUIT_VIEW||demo.state!=READY)return 10;
+    command("");if(demo.view!=HOME_VIEW)return 11;
+    command("4");command("BACK");if(demo.view!=HOME_VIEW)return 12;
+    return 0;
 }

@@ -1,4 +1,4 @@
-/* Top-down path prototype. Serial Monitor: CAL then Enter/THROW, SET, REPLAY.
+/* Player-view bowling prototype. USB terminal: menu, CAL, THROW, SET, REPLAY.
  * Same MPU6050/VGA wiring as the collection firmware. No host required for physics.
  */
 #include <stdio.h>
@@ -14,8 +14,11 @@
 #include "bowling_model.h"
 #include "VGA/vga16_graphics_v3.h"
 enum { NEED_CAL, READY, CALIBRATING, COUNTDOWN, RECORDING, PLAYING, BAD_CAPTURE, SENSOR_ERROR };
+enum { HOME_VIEW, GAME_VIEW, SETTINGS_VIEW, UNAVAILABLE_VIEW, QUIT_VIEW };
 typedef struct {
-    int state;unsigned countdown,phase,errors,missed,rail,samples;
+    int state,view,return_view;unsigned menu_index,unavailable_game;
+    unsigned countdown,phase,errors,missed,rail,samples;
+    bool sensor_ok,is_calibrated;
     bool has_shot;
     BowlTuning tuning;BowlThrow shot;BowlPath path;uint64_t animation_start;
 } Demo;
@@ -53,114 +56,247 @@ static void update_joystick(uint64_t now) {
     demo.has_shot=false;demo.state=READY;
     mutex_exit(&lock);
 }
-static const int lane_x=150,lane_bottom=440;
-#define SCALE 50.0f
-static int sx(float x){return lane_x+(int)lroundf(x*SCALE);}
-static int sy(float y){return lane_bottom-(int)lroundf(y*SCALE);}
-static void label(int x,int y,char color,const char *s){drawTextGLCD(x,y,(char *)s,color,BLACK);}
-static void draw_core(void) {
-    char text[100];
-    while(true) {
-        if(!draw_start_signal()){tight_loop_contents();continue;}
-        mutex_enter_blocking(&lock);memcpy(&screen,&demo,sizeof(screen));mutex_exit(&lock);
-        clearLowFrame(0,BLACK);
-        label(30,10,WHITE,"PICO SPORTS / BOWLING PATH DEMO");
-        const char *status="";
-        switch(screen.state) {
-            case NEED_CAL:status="Place +Z up; type CAL + Enter";break;
-            case READY:status="Joystick: move start / Enter: throw";break;
-            case CALIBRATING:status="CALIBRATING - keep still";break;
-            case COUNTDOWN:snprintf(text,sizeof(text),"GET READY: %u",screen.countdown);status=text;break;
-            case RECORDING:status=screen.phase==0?"HOLD STILL":screen.phase==1?"THROW NOW":"HOLD STILL - finishing";break;
-            case PLAYING:status="Path replay - Enter for next throw";break;
-            case BAD_CAPTURE:status="Capture rejected; see terminal";break;
-            case SENSOR_ERROR:status="IMU ERROR - check wiring / reboot";break;
-        }
-        label(30,30,YELLOW,status);
-        // Deliberately schematic lane, equal X/Y display scale in game units.
-        drawRect(sx(-BOWL_HALF_WIDTH),sy(BOWL_LENGTH),160,(int)(BOWL_LENGTH*SCALE)+1,WHITE);
-        drawVLine(sx(-BOWL_HALF_WIDTH)-12,sy(BOWL_LENGTH),376,DARK_GREEN);
-        drawVLine(sx(BOWL_HALF_WIDTH)+12,sy(BOWL_LENGTH),376,DARK_GREEN);
-        for(int y=90;y<440;y+=20)drawVLine(lane_x,y,6,DARK_GREEN);
-        drawHLine(sx(-BOWL_HALF_WIDTH),lane_bottom,160,CYAN);
-        float elapsed=(float)(time_us_64()-screen.animation_start)/1000000.0f;
-        unsigned last=0;
-        if(screen.has_shot) {
-            while(last+1<screen.path.count && screen.path.points[last+1].t<=elapsed)last++;
-            for(unsigned i=1;i<=last;i++)drawLine(sx(screen.path.points[i-1].x),sy(screen.path.points[i-1].y),sx(screen.path.points[i].x),sy(screen.path.points[i].y),YELLOW);
-        }
-        bool complete=screen.has_shot && last+1==screen.path.count;
-        for(int i=0;i<10;i++) {
-            float x,y;bowl_pin(i,&x,&y);
-            fillCircle(sx(x),sy(y),(int)(BOWL_PIN_RADIUS*SCALE),complete&&screen.path.pin==i?RED:WHITE);
-        }
-        float x=screen.has_shot?screen.path.points[last].x:screen.tuning.start_x;
-        float y=screen.has_shot?screen.path.points[last].y:0;
-        fillCircle(sx(x),sy(y),(int)(BOWL_BALL_RADIUS*SCALE),CYAN);
-        label(80,458,CYAN,"START / FOUL LINE");
-        label(280,65,WHITE,"Top-down schematic / game units");
-        label(280,87,YELLOW,screen.has_shot?bowl_labels[screen.shot.label]:"Awaiting first throw");
-        if(screen.has_shot) {
-            snprintf(text,sizeof(text),"Power %.2f   Hook %+.2f",screen.shot.power,screen.shot.hook);label(280,107,WHITE,text);
-            snprintf(text,sizeof(text),"Peak accel %.2f m/s^2",screen.shot.peak);label(280,125,WHITE,text);
-            snprintf(text,sizeof(text),"Speed %.2f units/s",screen.path.speed);label(280,143,WHITE,text);
-            snprintf(text,sizeof(text),"Curve accel %+.3f units/s^2",screen.path.hook_accel);label(280,161,WHITE,text);
-            if(complete) {
-                if(screen.path.pin>=0)snprintf(text,sizeof(text),"FIRST CONTACT: PIN %d",screen.path.pin+1);
-                else snprintf(text,sizeof(text),"%s",screen.path.gutter?"GUTTER":screen.path.stopped?"BALL STOPPED":"MISSED PINS");
-                label(280,185,YELLOW,text);
+// A fixed camera at the foul line. Physics stays in the original lane coordinates.
+// Keep the useful picture inside a small safe area because some VGA monitors crop
+// the outermost scan lines. The wider horizontal scale also makes the pin deck
+// readable from the player's viewpoint.
+#define CAMERA_CENTER_X 320
+#define CAMERA_X_SCALE 190.0f
+#define CAMERA_Y_SCALE 145.0f
+#define CAMERA_DEPTH 0.38f
+#define FOUL_LINE_Y 438
+static float perspective(float y){return 1.0f/(1.0f+CAMERA_DEPTH*y);}
+static int sx(float x,float y){return CAMERA_CENTER_X+(int)lroundf(x*CAMERA_X_SCALE*perspective(y));}
+static int sy(float y){return FOUL_LINE_Y-(int)lroundf(y*CAMERA_Y_SCALE*perspective(y));}
+static void label(int x,int y,char color,const char *s){drawTextGLCD(x,y,(char *)s,color,WHITE);}
+static void title(int x,int y,char color,const char *s){drawTextArial24(x,y,(char *)s,color,WHITE);}
+static void button(int x,int y,int w,int h,const char *name,const char *detail,bool selected){
+    fillRect(x,y,w,h,WHITE);
+    drawRect(x,y,w,h,selected?BLUE:LIGHT_BLUE);
+    if(selected)drawRect(x+2,y+2,w-4,h-4,BLUE);
+    label(x+12,y+14,BLUE,name);label(x+12,y+h-22,BLACK,detail);
+}
+static void draw_menu(const Demo *d){
+    clearLowFrame(0,WHITE);
+    title(24,22,BLUE,"PICO SPORTS");
+    label(26,56,BLACK,"because ECEs can have fun too!");
+    drawHLine(24,78,592,LIGHT_BLUE);
+    if(d->view==HOME_VIEW){
+        label(26,100,BLUE,"CHOOSE YOUR GAME");
+        const char *names[]={"1  BOWLING","2  BASKETBALL","3  CUP PONG"};
+        for(int i=0;i<3;i++){
+            int x=24+i*204;
+            button(x,126,184,142,names[i],i==0?"":"Coming soon",d->menu_index==(unsigned)i);
+            // Small sport icons use only the existing VGA primitives.
+            if(i==0){
+                fillCircle(x+76,186,16,BLUE);
+                for(int j=0;j<3;j++){
+                    fillCircle(x+117+j*10,178,4,BLUE);
+                    fillRect(x+113+j*10,183,8,18,BLUE);
+                }
+            }else if(i==1){
+                drawCircle(x+90,187,23,ORANGE);drawVLine(x+90,164,46,ORANGE);
+                drawHLine(x+67,187,46,ORANGE);
+            }else{
+                for(int j=0;j<3;j++)drawRect(x+63+j*22,172,18,30,BLUE);
+                fillCircle(x+95,158,5,ORANGE);
             }
         }
-        label(280,213,CYAN,"SET name value (then Enter)");
-        snprintf(text,sizeof(text),"start_x %+.2f    aim_deg %+.1f",screen.tuning.start_x,screen.tuning.aim_deg);label(280,235,WHITE,text);
-        snprintf(text,sizeof(text),"speed_gain %.2f  hook_gain %.2f",screen.tuning.speed_gain,screen.tuning.hook_gain);label(280,253,WHITE,text);
-        snprintf(text,sizeof(text),"friction %.2f    hook_start %.2f",screen.tuning.friction,screen.tuning.hook_start);label(280,271,WHITE,text);
-        snprintf(text,sizeof(text),"randomness %.2f (0 = repeatable)",screen.tuning.randomness);label(280,289,WHITE,text);
-        label(280,307,CYAN,"Joystick X: move starting position");
-        label(280,319,WHITE,"CAL: +Z-up calibration");
-        label(280,337,WHITE,"Enter/THROW: countdown + capture");
-        label(280,355,WHITE,"REPLAY: repeat last path");
-        label(280,373,WHITE,"RESET: restore tuning defaults");
-        snprintf(text,sizeof(text),"Samples %u  I2C %u  gaps %u",screen.samples,screen.errors,screen.missed);label(280,403,WHITE,text);
-        label(280,425,CYAN,"Red pin = first ball contact only");
-        label(280,443,CYAN,"No pin scattering or scoring yet");
+        button(24,292,286,64,"4  SETTINGS","Aim, power, curve, calibration",d->menu_index==3);
+        button(330,292,286,64,"5  QUIT","Stop this session",d->menu_index==4);
+        label(26,386,BLACK,"USB terminal: 1-5 selects an option directly.");
+        label(26,400,BLACK,"Type W then Enter: move up; S then Enter: move down.");
+        label(26,416,BLACK,"Press Enter to select the highlighted option.");
+        label(26,434,d->sensor_ok?BLUE:RED,d->sensor_ok?
+              d->is_calibrated?"Controller calibrated / ready":"Select Bowling, then CAL to calibrate":"IMU unavailable / check wiring and reboot");
+    }else if(d->view==SETTINGS_VIEW){
+        title(24,100,BLUE,"SETTINGS");
+        label(26,136,BLACK,"Type SET name value in the USB terminal.");
+        char line[80];
+        const char *keys[]={"start_x","aim_deg","speed_gain","hook_gain","friction","hook_start","randomness"};
+        const char *limits[]={"-1.3 to 1.3","-10 to 10 deg","0.5 to 2","0 to 3","0 to 1","0 to 0.9","0 to 1"};
+        float values[]={d->tuning.start_x,d->tuning.aim_deg,d->tuning.speed_gain,d->tuning.hook_gain,d->tuning.friction,d->tuning.hook_start,d->tuning.randomness};
+        for(int i=0;i<7;i++){
+            int y=166+i*26;
+            snprintf(line,sizeof(line),"%-12s  %+.2f",keys[i],values[i]);label(36,y,BLUE,line);
+            label(320,y,BLACK,limits[i]);
+        }
+        label(26,368,BLACK,"Example: SET aim_deg 2 / SET hook_gain 1.5");
+        label(26,390,BLACK,"Joystick changes start_x. RESET restores defaults.");
+        label(26,412,BLACK,"BACK returns. MENU chooses a game. QUIT ends session.");
+    }else if(d->view==UNAVAILABLE_VIEW){
+        title(24,110,BLUE,d->unavailable_game==1?"BASKETBALL":"CUP PONG");
+        label(26,170,BLACK,"Game coming soon.");
+        label(26,196,BLACK,"Gesture collection is implemented; this game is not yet playable.");
+        label(26,222,BLACK,"To collect throws, use MPU6050_IMU.uf2 and host/collect.py.");
+        button(24,290,592,64,"BACK TO GAME MENU","Press Enter or type MENU",true);
+    }else{
+        title(24,110,BLUE,"THANKS FOR PLAYING");
+        label(26,170,BLACK,"Session stopped. It is safe to close the USB terminal.");
+        label(26,196,BLACK,"Settings remain in RAM until reboot.");
+        button(24,290,592,64,"PLAY AGAIN","Press Enter or type MENU",true);
+    }
+    drawHLine(24,454,592,LIGHT_BLUE);
+    label(26,468,BLUE,"Pico 2 + MPU6050 / USB keyboard controls / VGA display");
+}
+static void draw_game(const Demo *d){
+    char text[100];
+    clearLowFrame(0,WHITE);
+    title(24,10,BLUE,"BOWLING");
+    label(418,14,BLUE,"MENU / SETTINGS / QUIT");
+    label(418,28,BLACK,"Type in USB terminal");
+    const char *status="";char color=BLUE;
+    switch(d->state){
+        case NEED_CAL:status="CALIBRATE CONTROLLER";break;
+        case READY:status="READY TO BOWL";break;
+        case CALIBRATING:status="KEEP STILL / +Z UP";break;
+        case COUNTDOWN:snprintf(text,sizeof(text),"GET READY  %u",d->countdown);status=text;break;
+        case RECORDING:status=d->phase==1?"THROW NOW":"HOLD STILL";color=d->phase==1?MED_GREEN:BLUE;break;
+        case PLAYING:break;
+        case BAD_CAPTURE:status="PLEASE TRY AGAIN";color=RED;break;
+        case SENSOR_ERROR:status="CHECK IMU WIRING";color=RED;break;
+    }
+    title(24,52,color,status);
+    label(26,84,BLACK,d->state==NEED_CAL?"Place sensor flat, +Z up. Type CAL and press Enter.":
+          d->state==CALIBRATING?"Leave the controller still for three seconds.":
+          d->state==BAD_CAPTURE?"Weak or incomplete capture. Press Enter to retry.":
+          d->state==SENSOR_ERROR?"Check 3.3V, GND, GP8 SDA / GP9 SCL; reboot.":
+          "Joystick: move start / Enter: bowl / MENU: choose game");
+    drawHLine(24,104,592,LIGHT_BLUE);
+    // A dark back wall keeps the larger white pin silhouettes visible.
+    fillRect(200,136,240,62,DARK_BLUE);
+    // Fill trapezoid row by row: boards converge toward the far pin deck.
+    for(int row=sy(BOWL_LENGTH);row<=FOUL_LINE_Y;row++){
+        float distance=FOUL_LINE_Y-row;
+        float y=distance/(CAMERA_Y_SCALE-CAMERA_DEPTH*distance);
+        int left=sx(-BOWL_HALF_WIDTH,y),right=sx(BOWL_HALF_WIDTH,y);
+        int gutter=(int)(12*perspective(y));
+        drawHLine(left-gutter,row,right-left+2*gutter+1,DARK_BLUE);
+        drawHLine(left,row,right-left+1,ORANGE);
+    }
+    for(int board=0;board<=16;board++){
+        float x=-BOWL_HALF_WIDTH+board*0.2f;
+        drawLine(sx(x,0),sy(0),sx(x,BOWL_LENGTH),sy(BOWL_LENGTH),DARK_ORANGE);
+    }
+    drawLine(sx(-BOWL_HALF_WIDTH,0),sy(0),sx(-BOWL_HALF_WIDTH,BOWL_LENGTH),sy(BOWL_LENGTH),WHITE);
+    drawLine(sx(BOWL_HALF_WIDTH,0),sy(0),sx(BOWL_HALF_WIDTH,BOWL_LENGTH),sy(BOWL_LENGTH),WHITE);
+    drawHLine(sx(-BOWL_HALF_WIDTH,0),FOUL_LINE_Y,sx(BOWL_HALF_WIDTH,0)-sx(-BOWL_HALF_WIDTH,0)+1,BLUE);
+    for(int i=-3;i<=3;i++){
+        int x=sx(i*.32f,1.3f),y=sy(1.3f);
+        drawLine(x-3,y+4,x,y-3,BLUE);drawLine(x,y-3,x+3,y+4,BLUE);
+    }
+    float elapsed=(float)(time_us_64()-d->animation_start)/1000000.0f;
+    unsigned last=0;
+    if(d->has_shot){
+        while(last+1<d->path.count&&d->path.points[last+1].t<=elapsed)last++;
+        for(unsigned i=1;i<=last;i++){
+            const BowlPoint *a=&d->path.points[i-1],*b=&d->path.points[i];
+            drawLine(sx(a->x,a->y),sy(a->y),sx(b->x,b->y),sy(b->y),YELLOW);
+        }
+    }
+    bool complete=d->has_shot&&last+1==d->path.count;
+    // Far rows first; pin size follows the same camera projection as the ball.
+    for(int i=9;i>=0;i--){
+        float x,y;bowl_pin(i,&x,&y);
+        int px=sx(x,y),py=sy(y),r=(int)lroundf(BOWL_PIN_RADIUS*CAMERA_X_SCALE*perspective(y));
+        char pin_color=complete&&d->path.pin==i?RED:WHITE;
+        fillCircle(px,py-r,r,pin_color);fillRect(px-r,py-3*r,2*r+1,2*r,pin_color);
+        fillCircle(px,py-4*r,r-1,pin_color);
+        drawHLine(px-r+1,py-3*r,2*r-1,RED);
+    }
+    float x=d->has_shot?d->path.points[last].x:d->tuning.start_x;
+    float y=d->has_shot?d->path.points[last].y:0;
+    int r=(int)lroundf(BOWL_BALL_RADIUS*CAMERA_X_SCALE*perspective(y));
+    int bx=sx(x,y),by=sy(y)-r;
+    fillCircle(bx,by,r,BLUE);fillCircle(bx-r/3,by-r/3,r/5,CYAN);
+    if(complete){
+        if(d->path.pin>=0)snprintf(text,sizeof(text),"FIRST CONTACT: PIN %d",d->path.pin+1);
+        else snprintf(text,sizeof(text),"%s",d->path.gutter?"GUTTER":d->path.stopped?"BALL STOPPED":"MISSED PINS");
+        label(232,122,BLUE,text);
+    }else label(232,122,BLUE,"PLAYER VIEW / PIN DECK");
+    if(d->has_shot){
+        snprintf(text,sizeof(text),"%s / Power %.2f / Hook %+.2f",bowl_labels[d->shot.label],d->shot.power,d->shot.hook);
+        label(14,446,BLUE,text);
+    }else label(14,446,BLUE,"Start with the same grip used for your training throws.");
+    snprintf(text,sizeof(text),"Samples %u / I2C %u / gaps %u / rail %u",d->samples,d->errors,d->missed,d->rail);
+    label(350,446,BLACK,text);
+    label(14,460,BLUE,"First contact only / pin scattering and scoring pending");
+}
+static void draw_core(void){
+    while(true){
+        if(!draw_start_signal()){tight_loop_contents();continue;}
+        mutex_enter_blocking(&lock);memcpy(&screen,&demo,sizeof(screen));mutex_exit(&lock);
+        if(screen.view==GAME_VIEW)draw_game(&screen);else draw_menu(&screen);
     }
 }
-static void help(void) {
-    puts("# BOWLING DEMO ready. CAL + Enter: place sensor +Z up and leave still 3 seconds.");
-    puts("# Then press Enter or send THROW: 3s countdown, 0.5s still, 2s THROW NOW, 0.5s still.");
-    puts("# Watch VGA cues. Path is displayed after recording; no measured release event.");
-    puts("# Joystick VRx on GPIO27/ADC1: move start left/right; release to hold. Enter locks position.");
+static void help(void){
+    puts("# PICO SPORTS: USB terminal controls the VGA menus. W/S then Enter, or 1-5.");
+    puts("# 1 BOWLING | 2 BASKETBALL (coming soon) | 3 CUP PONG (coming soon) | 4 SETTINGS | 5 QUIT");
+    puts("# MENU: game menu | BACK: previous screen | SETTINGS: tuning | QUIT: stop session");
+    puts("# Bowling: CAL (+Z up, still 3s), then Enter/THROW. REPLAY repeats last path.");
+    puts("# Capture: 3s countdown, 0.5s still, 2s THROW NOW, 0.5s still.");
+    puts("# Joystick VRx on GPIO27/ADC1 moves the starting position; Enter locks it.");
     puts("# SET start_x -0.5 | SET aim_deg 1 | SET hook_gain 1.5 | SET speed_gain 1.1");
-    puts("# SET friction 0.12 | SET hook_start 0.1 | SET randomness 0");
-    puts("# SET replays the last throw with new settings. REPLAY, RESET, INFO, HELP, STOP.");
+    puts("# SET friction 0.12 | SET hook_start 0.1 | SET randomness 0 | RESET defaults");
+    puts("# STOP cancels capture. This prototype has no pin scattering or scoring.");
 }
 static void replay(void) {
     bowl_simulate(&demo.shot,&demo.tuning,shot_seed,&demo.path);
     demo.animation_start=time_us_64();demo.state=PLAYING;
 }
-static void command(const char *line) {
+static void command(const char *line){
     bool busy=demo.state==RECORDING||demo.state==COUNTDOWN;
-    if(busy) {
-        if(!strcmp(line,"STOP")) {
+    // Navigation may cancel a pending capture; never leave acquisition running behind a menu.
+    bool home=!strcmp(line,"MENU")||!strcmp(line,"HOME");
+    bool quit=!strcmp(line,"QUIT")||!strcmp(line,"Q")||!strcmp(line,"5");
+    bool settings=!strcmp(line,"SETTINGS")||(!busy&&!strcmp(line,"4"));
+    if(home||quit||settings||!strcmp(line,"BACK")){
+        mutex_enter_blocking(&lock);
+        if(busy){demo.state=calibrated?READY:NEED_CAL;demo.has_shot=false;}
+        if(settings){demo.return_view=demo.view==GAME_VIEW?GAME_VIEW:HOME_VIEW;demo.view=SETTINGS_VIEW;}
+        else if(!strcmp(line,"BACK")&&demo.view==SETTINGS_VIEW)demo.view=demo.return_view;
+        else demo.view=quit?QUIT_VIEW:HOME_VIEW;
+        mutex_exit(&lock);puts("OK,navigation");return;
+    }
+    if(busy){
+        if(!strcmp(line,"STOP")){
             mutex_enter_blocking(&lock);demo.state=READY;mutex_exit(&lock);
             puts("OK,capture_cancelled");
         }
         return;
+    }
+    if(demo.view==HOME_VIEW){
+        if(!strcmp(line,"W")||!strcmp(line,"S")){
+            mutex_enter_blocking(&lock);demo.menu_index=(demo.menu_index+(!strcmp(line,"W")?4:1))%5;mutex_exit(&lock);
+            puts("OK,selection");return;
+        }
+        int choice=!line[0]?(int)demo.menu_index:strlen(line)==1&&line[0]>='1'&&line[0]<='5'?line[0]-'1':-1;
+        if(choice>=0){
+            mutex_enter_blocking(&lock);
+            demo.menu_index=(unsigned)choice;
+            if(choice==0){demo.view=GAME_VIEW;demo.state=!healthy?SENSOR_ERROR:calibrated?(demo.has_shot?PLAYING:READY):NEED_CAL;}
+            else if(choice<3){demo.view=UNAVAILABLE_VIEW;demo.unavailable_game=(unsigned)choice;}
+            else if(choice==3){demo.return_view=HOME_VIEW;demo.view=SETTINGS_VIEW;}
+            else demo.view=QUIT_VIEW;
+            mutex_exit(&lock);puts("OK,selected");return;
+        }
+    }else if(!line[0]&&(demo.view==UNAVAILABLE_VIEW||demo.view==QUIT_VIEW)){
+        mutex_enter_blocking(&lock);demo.view=HOME_VIEW;mutex_exit(&lock);puts("OK,menu");return;
     }
     if(!strcmp(line,"INFO")){printf("BOWL,1,%u,%u\n",healthy,calibrated);return;}
     if(!strcmp(line,"STOP")){puts("OK,idle");return;}
     if(!strcmp(line,"HELP")){help();puts("OK,help");return;}
     if(!strcmp(line,"CAL")) {
         if(!healthy){puts("ERR,sensor");return;}
-        mutex_enter_blocking(&lock);demo.state=CALIBRATING;mutex_exit(&lock);
+        mutex_enter_blocking(&lock);demo.view=GAME_VIEW;demo.state=CALIBRATING;demo.has_shot=false;demo.is_calibrated=false;mutex_exit(&lock);
         calibrated=imu_calibrate(&bias);
-        mutex_enter_blocking(&lock);demo.state=calibrated?READY:NEED_CAL;mutex_exit(&lock);
+        mutex_enter_blocking(&lock);demo.is_calibrated=calibrated;demo.state=calibrated?READY:NEED_CAL;mutex_exit(&lock);
         if(calibrated)puts("CAL,OK - Press Enter to record a throw.");
         else printf("ERR,%s\n",imu_calibration_report());
         return;
     }
     if(!line[0]||!strcmp(line,"THROW")) {
+        if(demo.view!=GAME_VIEW){puts("ERR,Select Bowling from MENU first");return;}
         if(!healthy||!calibrated){puts("ERR,Send CAL first with sensor level +Z up");return;}
         bowl_features_reset(&features);
         mutex_enter_blocking(&lock);
@@ -185,7 +321,7 @@ int main(void) {
     set_sys_clock_khz(150000,true);stdio_init_all();mutex_init(&lock);initVGA();
     adc_init();adc_gpio_init(JOY_GPIO);adc_select_input(JOY_ADC);
     joystick_last=time_us_64();
-    healthy=imu_init();demo.state=healthy?NEED_CAL:SENSOR_ERROR;demo.tuning=bowl_defaults();
+    healthy=imu_init();demo.sensor_ok=healthy;demo.view=HOME_VIEW;demo.state=healthy?NEED_CAL:SENSOR_ERROR;demo.tuning=bowl_defaults();
     multicore_launch_core1(draw_core);
     char input[128];unsigned used=0;bool overflow=false,last_cr=false,connected_before=false,pending=false;
     while(true) {
