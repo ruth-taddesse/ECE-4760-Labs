@@ -65,11 +65,38 @@ static void update_joystick(uint64_t now) {
 #define CAMERA_Y_SCALE 145.0f
 #define CAMERA_DEPTH 0.38f
 #define FOUL_LINE_Y 438
+#define DISPLAY_X_CORRECTION 0.75f // 640x480 stretched by monitor to 16:9
+#define PIN_RACK_X_SCALE 50.0f
+#define PIN_RACK_FRONT_Y 201
+#define PIN_RACK_ROW_GAP 13
 static float perspective(float y){return 1.0f/(1.0f+CAMERA_DEPTH*y);}
 static int sx(float x,float y){return CAMERA_CENTER_X+(int)lroundf(x*CAMERA_X_SCALE*perspective(y));}
 static int sy(float y){return FOUL_LINE_Y-(int)lroundf(y*CAMERA_Y_SCALE*perspective(y));}
 static int pin_row(int index){
     int row=0;while(index>=row+1){index-=row+1;row++;}return row;
+}
+static void fill_display_circle(int x,int y,int radius,char color){
+    int rx=(int)lroundf(radius*DISPLAY_X_CORRECTION);
+    if(rx<1)rx=1;
+    for(int dy=-radius;dy<=radius;dy++){
+        float normalized=(float)(dy*dy)/(float)(radius*radius);
+        int dx=(int)lroundf(rx*sqrtf(fmaxf(0,1-normalized)));
+        drawHLine(x-dx,y+dy,2*dx+1,color);
+    }
+}
+static void draw_display_circle(int x,int y,int radius,char color){
+    int rx=(int)lroundf(radius*DISPLAY_X_CORRECTION);
+    if(rx<1)rx=1;
+    for(int dy=-radius;dy<=radius;dy++){
+        float normalized=(float)(dy*dy)/(float)(radius*radius);
+        int dx=(int)lroundf(rx*sqrtf(fmaxf(0,1-normalized)));
+        drawPixel(x-dx,y+dy,color);drawPixel(x+dx,y+dy,color);
+    }
+    for(int dx=-rx;dx<=rx;dx++){
+        float normalized=(float)(dx*dx)/(float)(rx*rx);
+        int dy=(int)lroundf(radius*sqrtf(fmaxf(0,1-normalized)));
+        drawPixel(x+dx,y-dy,color);drawPixel(x+dx,y+dy,color);
+    }
 }
 static void label(int x,int y,char color,const char *s){drawTextGLCD(x,y,(char *)s,color,WHITE);}
 static void title(int x,int y,char color,const char *s){drawTextArial24(x,y,(char *)s,color,WHITE);}
@@ -92,17 +119,17 @@ static void draw_menu(const Demo *d){
             button(x,126,184,142,names[i],i==0?"":"Coming soon",d->menu_index==(unsigned)i);
             // Small sport icons use only the existing VGA primitives.
             if(i==0){
-                fillCircle(x+76,186,16,BLUE);
+                fill_display_circle(x+76,186,16,BLUE);
                 for(int j=0;j<3;j++){
-                    fillCircle(x+117+j*10,178,4,BLUE);
+                    fill_display_circle(x+117+j*10,178,4,BLUE);
                     fillRect(x+113+j*10,183,8,18,BLUE);
                 }
             }else if(i==1){
-                drawCircle(x+90,187,23,ORANGE);drawVLine(x+90,164,46,ORANGE);
-                drawHLine(x+67,187,46,ORANGE);
+                draw_display_circle(x+90,187,23,ORANGE);drawVLine(x+90,164,46,ORANGE);
+                drawHLine(x+73,187,35,ORANGE);
             }else{
                 for(int j=0;j<3;j++)drawRect(x+63+j*22,172,18,30,BLUE);
-                fillCircle(x+95,158,5,ORANGE);
+                fill_display_circle(x+95,158,5,ORANGE);
             }
         }
         button(24,292,286,64,"4  SETTINGS","Aim, power, curve, calibration",d->menu_index==3);
@@ -205,21 +232,22 @@ static void draw_game(const Demo *d){
     for(int i=9;i>=0;i--){
         float x,y;bowl_pin(i,&x,&y);
         int row=pin_row(i);
-        int px=CAMERA_CENTER_X+(int)lroundf(x*58.0f);
-        int py=198-row*16;
+        int px=CAMERA_CENTER_X+(int)lroundf(x*PIN_RACK_X_SCALE*DISPLAY_X_CORRECTION);
+        int py=PIN_RACK_FRONT_Y-row*PIN_RACK_ROW_GAP;
         char pin_color=complete&&d->path.pin==i?RED:WHITE;
-        fillCircle(px,py-3,5,pin_color);
-        fillCircle(px,py-8,6,pin_color);
-        fillRect(px-3,py-16,7,9,pin_color);
-        fillCircle(px,py-19,4,pin_color);
-        drawHLine(px-3,py-14,7,RED);
-        drawHLine(px-3,py-13,7,RED);
+        fill_display_circle(px,py-3,5,pin_color);
+        fill_display_circle(px,py-8,6,pin_color);
+        fillRect(px-2,py-16,5,9,pin_color);
+        fill_display_circle(px,py-19,4,pin_color);
+        drawHLine(px-2,py-14,5,RED);
+        drawHLine(px-2,py-13,5,RED);
     }
     float x=d->has_shot?d->path.points[last].x:d->tuning.start_x;
     float y=d->has_shot?d->path.points[last].y:0;
     int r=(int)lroundf(BOWL_BALL_RADIUS*CAMERA_X_SCALE*perspective(y));
     int bx=sx(x,y),by=sy(y)-r;
-    fillCircle(bx,by,r,BLUE);fillCircle(bx-r/3,by-r/3,r/5,CYAN);
+    fill_display_circle(bx,by,r,BLUE);
+    fill_display_circle(bx-(int)lroundf(r*DISPLAY_X_CORRECTION/3),by-r/3,r/5,CYAN);
     if(complete){
         if(d->path.pin>=0)snprintf(text,sizeof(text),"FIRST CONTACT: PIN %d",d->path.pin+1);
         else snprintf(text,sizeof(text),"%s",d->path.gutter?"GUTTER":d->path.stopped?"BALL STOPPED":"MISSED PINS");

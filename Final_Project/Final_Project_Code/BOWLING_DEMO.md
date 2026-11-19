@@ -10,6 +10,12 @@ The collection dashboard in `imu_training_data.c` is a separate firmware target.
 The original bowling capture, classifier, tuning, replay, and trajectory physics
 remain; the bowling renderer and navigation are updated here.
 
+The interface is designed for the lab monitor's **16:9 / Fill** display mode.
+The electrical VGA signal remains 640x480. Game circles and pin silhouettes are
+drawn horizontally compressed so the monitor's 4:3-to-16:9 stretch restores
+their intended proportions. Raw framebuffer previews stay 640x480; simulated
+monitor previews are written under `build/bowling_ui/monitor_16x9/`.
+
 ## Run
 
 **VS Code USB shortcut:** Close Serial Monitor, then choose **Terminal > Run Task > Run Bowling Demo (USB)**. This task builds and explicitly loads `BOWLING_DEMO.uf2`. The generic **Run Project** task uses the extension's selected target and may still load the collection firmware. If USB loading fails, use BOOTSEL and copy the UF2 as described below. The bowling screen says **PICO SPORTS / BOWLING PATH DEMO**, with a lane and ten white pins.
