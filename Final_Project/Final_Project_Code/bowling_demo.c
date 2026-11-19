@@ -68,6 +68,9 @@ static void update_joystick(uint64_t now) {
 static float perspective(float y){return 1.0f/(1.0f+CAMERA_DEPTH*y);}
 static int sx(float x,float y){return CAMERA_CENTER_X+(int)lroundf(x*CAMERA_X_SCALE*perspective(y));}
 static int sy(float y){return FOUL_LINE_Y-(int)lroundf(y*CAMERA_Y_SCALE*perspective(y));}
+static int pin_row(int index){
+    int row=0;while(index>=row+1){index-=row+1;row++;}return row;
+}
 static void label(int x,int y,char color,const char *s){drawTextGLCD(x,y,(char *)s,color,WHITE);}
 static void title(int x,int y,char color,const char *s){drawTextArial24(x,y,(char *)s,color,WHITE);}
 static void button(int x,int y,int w,int h,const char *name,const char *detail,bool selected){
@@ -163,8 +166,9 @@ static void draw_game(const Demo *d){
           d->state==SENSOR_ERROR?"Check 3.3V, GND, GP8 SDA / GP9 SCL; reboot.":
           "Joystick: move start / Enter: bowl / MENU: choose game");
     drawHLine(24,104,592,LIGHT_BLUE);
-    // A dark back wall keeps the larger white pin silhouettes visible.
-    fillRect(200,136,240,62,DARK_BLUE);
+    label(232,112,BLUE,"PLAYER VIEW / PIN DECK");
+    // A dark back wall keeps the separated white pin silhouettes visible.
+    fillRect(190,124,260,80,DARK_BLUE);
     // Fill trapezoid row by row: boards converge toward the far pin deck.
     for(int row=sy(BOWL_LENGTH);row<=FOUL_LINE_Y;row++){
         float distance=FOUL_LINE_Y-row;
@@ -195,14 +199,21 @@ static void draw_game(const Demo *d){
         }
     }
     bool complete=d->has_shot&&last+1==d->path.count;
-    // Far rows first; pin size follows the same camera projection as the ball.
+    // The collision model retains physical pin coordinates. For the small VGA
+    // display, exaggerate rack depth and spacing so the four rows remain legible.
+    // Draw far rows first so nearer pins correctly cover farther pins.
     for(int i=9;i>=0;i--){
         float x,y;bowl_pin(i,&x,&y);
-        int px=sx(x,y),py=sy(y),r=(int)lroundf(BOWL_PIN_RADIUS*CAMERA_X_SCALE*perspective(y));
+        int row=pin_row(i);
+        int px=CAMERA_CENTER_X+(int)lroundf(x*58.0f);
+        int py=198-row*16;
         char pin_color=complete&&d->path.pin==i?RED:WHITE;
-        fillCircle(px,py-r,r,pin_color);fillRect(px-r,py-3*r,2*r+1,2*r,pin_color);
-        fillCircle(px,py-4*r,r-1,pin_color);
-        drawHLine(px-r+1,py-3*r,2*r-1,RED);
+        fillCircle(px,py-3,5,pin_color);
+        fillCircle(px,py-8,6,pin_color);
+        fillRect(px-3,py-16,7,9,pin_color);
+        fillCircle(px,py-19,4,pin_color);
+        drawHLine(px-3,py-14,7,RED);
+        drawHLine(px-3,py-13,7,RED);
     }
     float x=d->has_shot?d->path.points[last].x:d->tuning.start_x;
     float y=d->has_shot?d->path.points[last].y:0;
@@ -212,8 +223,8 @@ static void draw_game(const Demo *d){
     if(complete){
         if(d->path.pin>=0)snprintf(text,sizeof(text),"FIRST CONTACT: PIN %d",d->path.pin+1);
         else snprintf(text,sizeof(text),"%s",d->path.gutter?"GUTTER":d->path.stopped?"BALL STOPPED":"MISSED PINS");
-        label(232,122,BLUE,text);
-    }else label(232,122,BLUE,"PLAYER VIEW / PIN DECK");
+        label(232,112,BLUE,text);
+    }
     if(d->has_shot){
         snprintf(text,sizeof(text),"%s / Power %.2f / Hook %+.2f",bowl_labels[d->shot.label],d->shot.power,d->shot.hook);
         label(14,446,BLUE,text);
