@@ -51,6 +51,9 @@ def simulate(shot,tuning=None,seed=42):
     return result
 
 class BowlingTests(unittest.TestCase):
+    def test_joystick_menu_and_button(self):
+        self.assertEqual(lib.test_joystick_menu(),0)
+
     def test_joystick_position_and_capture_lock(self):
         lib.test_joystick.argtypes=[C.c_uint,C.c_int,C.c_float,C.c_uint]
         lib.test_joystick.restype=C.c_float

@@ -14,10 +14,16 @@ static int frames;
 static uint64_t mock_time;
 static unsigned bounds_errors;
 static bool calibration_ok;
-static uint16_t mock_adc=2048;
+static uint16_t mock_adc=2048, mock_y=2048;
+static unsigned mock_channel;
+static bool mock_sw=true;
+void gpio_init(unsigned p){(void)p;}
+void gpio_set_dir(unsigned p,bool out){(void)p;(void)out;}
+void gpio_pull_up(unsigned p){(void)p;}
+bool gpio_get(unsigned p){(void)p;return mock_sw;}
 void adc_init(void){} void adc_gpio_init(unsigned gpio){(void)gpio;}
-void adc_select_input(unsigned input){(void)input;}
-uint16_t adc_read(void){return mock_adc;}
+void adc_select_input(unsigned input){mock_channel=input;}
+uint16_t adc_read(void){return mock_channel==0?mock_adc:mock_y;}
 float test_joystick(unsigned raw,int state,float start,unsigned ticks){
     memset(&demo,0,sizeof(demo));demo.view=GAME_VIEW;demo.state=state;demo.tuning=bowl_defaults();
     demo.tuning.start_x=start;mock_adc=(uint16_t)raw;joystick_last=0;
@@ -107,5 +113,27 @@ int test_navigation(void){
     command("THROW");command("QUIT");if(demo.view!=QUIT_VIEW||demo.state!=READY)return 10;
     command("");if(demo.view!=HOME_VIEW)return 11;
     command("4");command("BACK");if(demo.view!=HOME_VIEW)return 12;
+    return 0;
+}
+
+int test_joystick_menu(void){
+    memset(&demo,0,sizeof(demo));demo.view=HOME_VIEW;demo.state=NEED_CAL;
+    demo.tuning=bowl_defaults();joystick_last=button_changed=0;
+    button_raw=button_stable=false;menu_direction=0;mock_sw=true;
+    mock_adc=4095;mock_y=2048;update_joystick(10000);
+    if(demo.menu_index!=1||demo.tuning.start_x!=0)return 1;
+    update_joystick(20000);if(demo.menu_index!=1)return 2;
+    mock_adc=2048;update_joystick(30000);
+    mock_y=0;update_joystick(40000);if(demo.menu_index!=3)return 3;
+    mock_y=2048;mock_sw=false;update_joystick(50000);
+    mock_sw=true;update_joystick(60000); // bounce: no selection
+    if(demo.view!=HOME_VIEW)return 4;
+    mock_sw=false;update_joystick(70000);update_joystick(100000);
+    if(demo.view!=SETTINGS_VIEW)return 5;
+    update_joystick(200000);if(demo.view!=SETTINGS_VIEW)return 6;
+    mock_sw=true;update_joystick(210000);update_joystick(240000);
+    mock_sw=false;update_joystick(250000);update_joystick(280000);
+    if(demo.view!=HOME_VIEW)return 7;
+    mock_sw=true;button_raw=button_stable=false;
     return 0;
 }

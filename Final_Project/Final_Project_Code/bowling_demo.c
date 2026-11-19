@@ -29,30 +29,65 @@ static BowlFeatures features;
 static bool healthy,calibrated;
 static uint64_t countdown_end,capture_start,next_sample;
 static unsigned shot_seed=1;
-// VRx: GPIO27 / ADC1 / physical pin 32. Power joystick from 3.3 V.
-#define JOY_GPIO 27
-#define JOY_ADC 1
+// Vy -> ADC0/GP26 (horizontal), Vx -> ADC1/GP27 (vertical).
+// SW -> GP28, active low to ground; joystick supply must be 3.3 V.
 #define JOY_CENTER 2048.0f
 #define JOY_DEADZONE 256.0f
-#define JOY_SPEED 1.5f // lane units per second at full deflection
-#define JOY_DIRECTION 1.0f // change to -1 if the mounted joystick is reversed
-static uint64_t joystick_last;
+#define JOY_SPEED 1.5f
+#define JOY_DIRECTION 1.0f
+#define JOY_Y_DIRECTION -1.0f // mounted joystick: lower ADC values move down
+#define JOY_SW 28
+static uint64_t joystick_last,button_changed,menu_repeat;
+static bool button_raw,button_stable;
+static int menu_direction;
+static void command(const char *line);
+static float joystick_axis(unsigned channel){
+    adc_select_input(channel);(void)adc_read(); // discard first sample after switching
+    unsigned sum=0;for(int i=0;i<8;i++)sum+=adc_read();
+    return sum/8.0f-JOY_CENTER;
+}
 static void update_joystick(uint64_t now) {
     if(now-joystick_last<10000)return;
     float dt=fminf((now-joystick_last)*1e-6f,0.02f);
     joystick_last=now;
-    // No ADC work during capture; position is frozen from countdown through replay.
+    bool pressed=!gpio_get(JOY_SW);
+    if(pressed!=button_raw){button_raw=pressed;button_changed=now;}
+    bool select=false;
+    if(now-button_changed>=30000 && button_stable!=button_raw){
+        button_stable=button_raw;select=button_stable;
+    }
+    // Selection is menu-only: never accidentally start/cancel a throw by gripping SW.
+    if(select){
+        if(demo.view==HOME_VIEW||demo.view==UNAVAILABLE_VIEW||demo.view==QUIT_VIEW){command("");return;}
+        if(demo.view==SETTINGS_VIEW){command("BACK");return;}
+    }
+    if(demo.view==HOME_VIEW){
+        float x=JOY_DIRECTION*joystick_axis(0),y=JOY_Y_DIRECTION*joystick_axis(1);
+        int direction=0;
+        if(fmaxf(fabsf(x),fabsf(y))>900)
+            direction=fabsf(x)>fabsf(y)?(x>0?1:2):(y>0?3:4);
+        if(!direction){menu_direction=0;return;}
+        if(direction!=menu_direction || now>=menu_repeat){
+            bool first=direction!=menu_direction;
+            menu_direction=direction;menu_repeat=now+(first?400000:180000);
+            // Spatial navigation: three game tiles above Settings and Quit.
+            static const unsigned next[4][5]={
+                {1,2,2,4,4}, {0,0,1,3,3}, {3,3,4,3,4}, {0,1,2,0,2}
+            };
+            mutex_enter_blocking(&lock);demo.menu_index=next[direction-1][demo.menu_index];mutex_exit(&lock);
+        }
+        return;
+    }
+    menu_direction=0;
+    if(demo.view!=GAME_VIEW)return;
     bool finished=demo.state==PLAYING && demo.path.count &&
         (now-demo.animation_start)*1e-6f>=demo.path.points[demo.path.count-1].t;
     if(demo.state!=READY && demo.state!=BAD_CAPTURE && !finished)return;
-    adc_select_input(JOY_ADC);
-    unsigned sum=0;for(int i=0;i<8;i++)sum+=adc_read();
-    float delta=sum/8.0f-JOY_CENTER;
+    float delta=joystick_axis(0);
     if(fabsf(delta)<=JOY_DEADZONE)return;
     float velocity=JOY_DIRECTION*copysignf((fabsf(delta)-JOY_DEADZONE)/(2048.0f-JOY_DEADZONE),delta);
     mutex_enter_blocking(&lock);
     demo.tuning.start_x=fmaxf(-1.3f,fminf(1.3f,demo.tuning.start_x+velocity*JOY_SPEED*dt));
-    // Moving after a completed shot returns the ball to the foul line for the next throw.
     demo.has_shot=false;demo.state=READY;
     mutex_exit(&lock);
 }
@@ -107,9 +142,9 @@ static void draw_menu(const Demo *d){
         }
         button(24,292,286,64,"4  SETTINGS","Aim, power, curve, calibration",d->menu_index==3);
         button(330,292,286,64,"5  QUIT","Stop this session",d->menu_index==4);
-        label(26,386,BLACK,"USB terminal: 1-5 selects an option directly.");
-        label(26,400,BLACK,"Type W then Enter: move up; S then Enter: move down.");
-        label(26,416,BLACK,"Press Enter to select the highlighted option.");
+        label(26,386,BLACK,"Joystick: left/right across tiles; up/down changes row.");
+        label(26,400,BLACK,"Press joystick SW to select the highlighted option.");
+        label(26,416,BLACK,"USB keyboard: W/S + Enter, or 1-5, also works.");
         label(26,434,d->sensor_ok?BLUE:RED,d->sensor_ok?
               d->is_calibrated?"Controller calibrated / ready":"Select Bowling, then CAL to calibrate":"IMU unavailable / check wiring and reboot");
     }else if(d->view==SETTINGS_VIEW){
@@ -125,22 +160,22 @@ static void draw_menu(const Demo *d){
             label(320,y,BLACK,limits[i]);
         }
         label(26,368,BLACK,"Example: SET aim_deg 2 / SET hook_gain 1.5");
-        label(26,390,BLACK,"Joystick changes start_x. RESET restores defaults.");
+        label(26,390,BLACK,"Press joystick SW to go back. RESET restores defaults.");
         label(26,412,BLACK,"BACK returns. MENU chooses a game. QUIT ends session.");
     }else if(d->view==UNAVAILABLE_VIEW){
         title(24,110,BLUE,d->unavailable_game==1?"BASKETBALL":"CUP PONG");
         label(26,170,BLACK,"Game coming soon.");
         label(26,196,BLACK,"Gesture collection is implemented; this game is not yet playable.");
         label(26,222,BLACK,"To collect throws, use MPU6050_IMU.uf2 and host/collect.py.");
-        button(24,290,592,64,"BACK TO GAME MENU","Press Enter or type MENU",true);
+        button(24,290,592,64,"BACK TO GAME MENU","Press SW, Enter or type MENU",true);
     }else{
         title(24,110,BLUE,"THANKS FOR PLAYING");
         label(26,170,BLACK,"Session stopped. It is safe to close the USB terminal.");
         label(26,196,BLACK,"Settings remain in RAM until reboot.");
-        button(24,290,592,64,"PLAY AGAIN","Press Enter or type MENU",true);
+        button(24,290,592,64,"PLAY AGAIN","Press SW, Enter or type MENU",true);
     }
     drawHLine(24,454,592,LIGHT_BLUE);
-    label(26,468,BLUE,"Pico 2 + MPU6050 / USB keyboard controls / VGA display");
+    label(26,468,BLUE,"Pico 2 + MPU6050 / Joystick + USB keyboard / VGA");
 }
 static void draw_game(const Demo *d){
     char text[100];
@@ -246,7 +281,7 @@ static void help(void){
     puts("# MENU: game menu | BACK: previous screen | SETTINGS: tuning | QUIT: stop session");
     puts("# Bowling: CAL (+Z up, still 3s), then Enter/THROW. REPLAY repeats last path.");
     puts("# Capture: 3s countdown, 0.5s still, 2s THROW NOW, 0.5s still.");
-    puts("# Joystick VRx on GPIO27/ADC1 moves the starting position; Enter locks it.");
+    puts("# Joystick Vy ADC0: horizontal/start; Vx ADC1: vertical; SW GP28: menu select.");
     puts("# SET start_x -0.5 | SET aim_deg 1 | SET hook_gain 1.5 | SET speed_gain 1.1");
     puts("# SET friction 0.12 | SET hook_start 0.1 | SET randomness 0 | RESET defaults");
     puts("# STOP cancels capture. This prototype has no pin scattering or scoring.");
@@ -330,7 +365,8 @@ static void command(const char *line){
 }
 int main(void) {
     set_sys_clock_khz(150000,true);stdio_init_all();mutex_init(&lock);initVGA();
-    adc_init();adc_gpio_init(JOY_GPIO);adc_select_input(JOY_ADC);
+    adc_init();adc_gpio_init(26);adc_gpio_init(27);
+    gpio_init(JOY_SW);gpio_set_dir(JOY_SW,GPIO_IN);gpio_pull_up(JOY_SW);
     joystick_last=time_us_64();
     healthy=imu_init();demo.sensor_ok=healthy;demo.view=HOME_VIEW;demo.state=healthy?NEED_CAL:SENSOR_ERROR;demo.tuning=bowl_defaults();
     multicore_launch_core1(draw_core);

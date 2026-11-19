@@ -39,8 +39,7 @@ If the COM number changes, run without `--port` to list ports. You can instead u
 
 ## Menu controls
 
-Menu controls are newline commands entered in the USB terminal. The joystick
-adjusts the bowling starting position but does not navigate the menu.
+Joystick navigation follows the tile layout: left/right across tiles, up/down between rows. Press SW to select. Hold a direction to repeat after 400 ms, then every 180 ms. SW has 30 ms debounce and triggers only once per press. In Settings SW returns; on Coming Soon or Quit it returns to the main menu. USB commands still work. SW does not start throws; continue using Enter in Bowling.
 
 - `1`: Bowling, the playable trajectory prototype.
 - `2` / `3`: Basketball / Cup pong. These open an explicit **coming soon** page;
@@ -71,9 +70,9 @@ The game runs on the Pico. Python only supplies keyboard commands and terminal f
 
 ### Joystick starting position
 
-Wire joystick VRx to **GPIO27 / ADC1 / physical pin 32**, VCC to **3.3 V**, and GND to Pico ground. After IMU calibration, pushing left/right moves the cyan ball along the foul line; releasing the stick holds that position. Greater deflection moves faster. Pressing Enter freezes the position through countdown, capture and animation. After animation finishes, moving the joystick clears the old path and positions the next throw. No joystick button is required.
+Wire joystick **Vy to GPIO26 / ADC0 / physical pin 31** (horizontal), **Vx to GPIO27 / ADC1 / physical pin 32** (vertical), and **SW to GPIO28 / physical pin 34** (active-low switch to GND with an internal pull-up), VCC to **3.3 V**, and GND to Pico ground. After IMU calibration, pushing left/right moves the cyan ball along the foul line; releasing the stick holds that position. Greater deflection moves faster. Pressing Enter freezes the position through countdown, capture and animation. After animation finishes, moving the joystick clears the old path and positions the next throw. No joystick button is required.
 
-The input is averaged at 100 Hz with a 256-count center dead zone. Starting position stays within ±1.3 lane units. Adjust `JOY_CENTER`, `JOY_DEADZONE`, `JOY_SPEED`, or `JOY_DIRECTION` near the top of `bowling_demo.c` if needed; set direction to `-1.0f` if left/right are reversed. Rebuild and flash after changing these constants. Keep the joystick connected when using this firmware, since a disconnected ADC input can float.
+The input is averaged at 100 Hz with a 256-count center dead zone. Starting position stays within ±1.3 lane units. Adjust `JOY_CENTER`, `JOY_DEADZONE`, `JOY_SPEED`, or `JOY_DIRECTION` (horizontal) or `JOY_Y_DIRECTION` (vertical) near the top of `bowling_demo.c` if needed; set direction to `-1.0f` if left/right are reversed. Rebuild and flash after changing these constants. Keep the joystick connected when using this firmware, since a disconnected ADC input can float.
 
 Enter commands such as `SET hook_gain 1.5`. Each successful change automatically replays the last throw, allowing comparisons without another gesture. `REPLAY` repeats it; `RESET` restores defaults. `STOP` cancels a capture when sent directly over serial.
 
